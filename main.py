@@ -1,16 +1,27 @@
-# This is a sample Python script.
+# Copyright (C) 2026 Михаил Бурдуковский
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Полный текст лицензии — в файле LICENSE в корне проекта.
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+"""
+Smart Voice Recorder — точка входа.
+
+Запуск:
+    poetry run python main.py
+
+Приложение пишет голосовые заметки и расшифровывает их локально,
+моделью Whisper. Интернет для расшифровки не нужен: модель
+скачивается один раз и дальше берётся из кэша на диске.
+"""
+
+import sys
 
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+def main() -> int:
+    from src.main_window import run
+
+    return run()
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+if __name__ == "__main__":
+    sys.exit(main())

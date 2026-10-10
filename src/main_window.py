@@ -1,0 +1,1365 @@
+# Copyright (C) 2026 Михаил Бурдуковский
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Полный текст лицензии — в файле LICENSE в корне проекта.
+
+"""
+Главное окно приложения.
+
+Окно не ждёт завершения записи и не ждёт конца распознавания:
+и то и другое идёт в отдельных потоках, а сюда приходят только
+сообщения о том, что изменилось. Поэтому интерфейс не замирает,
+даже пока идёт расшифровка на несколько минут.
+
+Раскладка горизонтальная: настройки сверху, кнопки записи в
+центре, записи и выезжающая панель с текстом снизу.
+"""
+
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from PyQt6.QtCore import (
+    QObject,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QCompleter,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+import storage
+from src import config
+from src.config import AVAILABLE_MODELS, Settings
+from src.core.icons import app_icon, icon
+from src.core.styles import (
+    LIVE,
+    MUTED,
+    apply_locale,
+    apply_property,
+    apply_theme,
+)
+from src.model_store import ModelStore
+from src.recorder import Recorder, candidate_devices, default_device, test_device
+from src.transcriber import Transcriber
+from src.widgets import (
+    IDLE,
+    PAUSED,
+    RECORDING,
+    PulseButton,
+    RecordIndicator,
+    format_duration,
+)
+
+# Обновление индикатора и таймера. Быстрее 30 раз в секунду
+# незаметно глазом, но окно перестаёт отвечать.
+UI_TICK_MS = 33
+
+
+class Signals(QObject):
+    """Мост из рабочих потоков в интерфейс.
+
+    Qt требует трогать элементы интерфейса только из главного потока,
+    поэтому всё, что приходит из записи и распознавания, проходит
+    через эти сигналы.
+    """
+
+    recorded = pyqtSignal(str, float, float)  # путь, длительность, пик
+    nothing_recorded = pyqtSignal()
+    record_failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    model_ready = pyqtSignal()
+    model_failed = pyqtSignal(str)
+
+    file_started = pyqtSignal(str)
+    file_done = pyqtSignal(str, int, str)  # путь, строк, текст
+    all_done = pyqtSignal(int, int, bool)  # сделано, всего, отменено
+    transcribe_failed = pyqtSignal(str)
+
+
+# Столбцы таблицы записей
+# Виды сообщений внизу окна. Цвет выбирается по смыслу:
+# успех, предупреждение и ошибка не должны выглядеть одинаково
+INFO = "info"
+SUCCESS = "success"
+WARNING = "warning"
+ERROR = "error"
+
+COLUMN_BLOCK = 0
+COLUMN_FILE = 1
+COLUMN_STATUS = 2
+COLUMN_LENGTH = 3
+COLUMN_SIZE = 4
+
+COLUMN_NAMES = [
+    "Папка",
+    "Файл",
+    "Текст",
+    "Длительность, мин:сек",
+    # Единицы в заголовке не дублируем: «МБ» уже стоит в самом значении,
+    # а лишние буквы отбирают место у имени файла
+    "Размер",
+]
+
+
+@dataclass
+class TextBlock:
+    """Кусок текста в окне и файл, из которого он взят.
+
+    Границы куска ищутся по строке-разделителю прямо в тексте окна.
+    Хранить смещения бесполезно: любая правка пользователя
+    в начале окна сдвинула бы их все.
+    """
+
+    wav: Path
+    separator: str
+
+
+class MainWindow(QMainWindow):
+    """Окно приложения."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        # Иконка ставится здесь, а не в run(): окно может быть создано
+        # и без запуска приложения, и иконка нужна в обоих случаях
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+
+        # Окно открывается ровно под содержимое: вторая зона свёрнута
+        self.resize(920, 380)
+
+        self.settings = Settings()
+        self.recordings = self.settings.recordings_path()
+        self.model_store = ModelStore()
+        self.transcriber = Transcriber(self.model_store)
+        self.signals = Signals()
+
+        # Наполненное окно: куски текста и файлы, из которых они взяты
+        self.blocks: list[TextBlock] = []
+        # Правки пользователя, ещё не записанные на диск
+        self.dirty = False
+        self._appending = False
+
+        self._build_ui()
+        self._connect()
+
+        self._fill_devices()
+        self._fill_models()
+        self._refresh_list()
+        self._start_model()
+        self._start_device_probe()
+        self._tick_timer()
+
+    # ---------------------------------------------------------------- сборка
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("Голосовые заметки")
+        self.resize(920, 680)  # Чуть расширим для удобства
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        layout.addLayout(self._build_top_row())
+        layout.addLayout(self._build_control_row())
+        layout.addWidget(self._build_level())
+        layout.addWidget(self._build_details_zone())
+
+        self.status = QLabel("Готово")
+        # Свойство kind задаёт цвет по смыслу и перебивает приглушённый
+        # текст, поэтому muted здесь не нужен
+        self.status.setProperty("kind", INFO)
+        # Без этого подпись впитывает всё свободное место окна
+        # и выглядит вторым пустым окном внизу экрана
+        self.status.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
+        layout.addWidget(self.status)
+
+    def _say(self, text: str, kind: str = INFO) -> None:
+        """Сообщение внизу окна с цветом по смыслу.
+
+        Без unpolish и polish Qt не перечитывает правило для нового
+        свойства, и подпись осталась бы прежнего цвета.
+        """
+        self.status.setText(text)
+        apply_property(self.status, "kind", kind)
+
+    def _build_details_zone(self) -> QWidget:
+        """Вторая зона: список записей и текст распознавания.
+
+        Зона свёрнута при запуске и поднимается по кнопке или сама
+        после распознавания. Постоянная часть окна — только то,
+        что нужно для записи: блок, микрофон, кнопки и индикатор.
+        """
+        zone = QWidget()
+        zone.setProperty("zone", True)
+
+        box = QVBoxLayout(zone)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(10)
+
+        box.addLayout(self._build_list_row())
+
+        # Пружина прижимает текст к низу окна, когда панель высокая
+        box.addStretch(1)
+
+        box.addWidget(self._build_text_panel())
+
+        self.details_zone = zone
+        zone.setMaximumHeight(0)
+
+        # Зона поднимается и опускается анимацией высоты:
+        # анимировать геометрию внутри слоя неудобно, а
+        # maximumHeight работает устойчиво при любой длине текста
+        self._zone_animation = QPropertyAnimation(zone, b"maximumHeight")
+        self._zone_animation.setDuration(180)
+        # Окно ужимается вместе с зоной, но только когда она доехала
+        self._zone_animation.finished.connect(self._fit_window)
+
+        return zone
+
+    def _build_top_row(self) -> QHBoxLayout:
+        """Название блока, микрофон, модель, папка записей."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        row.addWidget(self._icon_label("block", "Папка для записи"))
+
+        self.block_input = QLineEdit()
+        self.block_input.setPlaceholderText(
+            "название записи — например: идеи, планёрка"
+        )
+        self.block_input.setText(self.settings.last_block)
+        self.block_input.setClearButtonEnabled(True)
+
+        # Таблица перечитывается не на каждую букву, а когда название
+        # перестало меняться: иначе пришлось бы открывать все wav
+        self._block_timer = QTimer(self)
+        self._block_timer.setSingleShot(True)
+        self._block_timer.setInterval(400)
+        self._block_timer.timeout.connect(lambda: self._refresh_list(announce=False))
+
+        # Подсказки из прошлых названий: то, что уже использовалось
+        known = storage.blocks(self.recordings)
+        if known:
+            completer = QCompleter(known)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            self.block_input.setCompleter(completer)
+        row.addWidget(self.block_input, 3)
+        self.block_input.returnPressed.connect(self._on_block_entered)
+        self.block_input.textChanged.connect(
+            lambda _: (self._update_block_hint(), self._on_block_typed())
+        )
+        self._update_block_hint()
+
+        row.addWidget(self._icon_label("microphone", "Микрофон"))
+
+        self.device_box = QComboBox()
+        self.device_box.setMinimumWidth(230)
+        self.device_box.setToolTip("Микрофон для записи")
+        row.addWidget(self.device_box, 2)
+
+        row.addWidget(self._icon_label("models", "Модель распознавания"))
+
+        self.model_box = QComboBox()
+        for name, label in AVAILABLE_MODELS.items():
+            self.model_box.addItem(label, name)
+        row.addWidget(self.model_box, 2)
+
+        return row
+
+    @staticmethod
+    def _icon_label(name: str, tip: str) -> QLabel:
+        """Значок вместо текстовой надписи перед полем.
+
+        Подпись занимала бы место и дублировала то, что уже
+        написано в самом поле. Смысл остаётся в подсказке.
+        """
+        label = QLabel()
+        label.setPixmap(icon(name, 20).pixmap(20, 20))
+        label.setToolTip(tip)
+        label.setFixedWidth(24)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return label
+
+    def _current_block(self) -> str:
+        """Папка текущего блока — та, куда едут записи."""
+        return storage.sanitize(self.block_input.text().strip()) or storage.NO_BLOCK
+
+    def _block_target(self) -> Path:
+        """Папка, куда попадёт следующая запись."""
+        return storage.block_dir(self.recordings, self.block_input.text())
+
+    def _update_block_hint(self) -> None:
+        """Подсказка с полным путём: папку блока легко принять
+        за корень, а найти потом записи невозможно."""
+        self.block_input.setToolTip(f"Записи попадут сюда:\n{self._block_target()}")
+
+    def _on_block_typed(self) -> None:
+        """Перечитывает таблицу, когда название блока меняется.
+
+        С задержкой: scan() открывает каждый wav ради длительности,
+        а набор названия вызывает это на каждую букву.
+        """
+        self._block_timer.start()
+
+    def _on_block_entered(self) -> None:
+        """Enter в поле папки: показываем, куда пойдёт запись.
+
+        Фокус с поля уводим: после Enter название принято, и
+        мигающий курсор в поле только мешает — он читается как
+        «здесь ещё что-то печатать».
+        """
+        self._block_timer.stop()
+        self.block_input.clearFocus()
+
+        target = self._block_target()
+        self._update_block_hint()
+        self._refresh_list()
+
+        if self.block_input.text().strip():
+            self._say(f"Записи будут в папку {target}")
+        else:
+            self._say(f"Без названия папки — записи в {target}", WARNING)
+
+    def _build_control_row(self) -> QHBoxLayout:
+        """Кнопки записи.
+
+        На первой клавише три состояния: начать, пауза и продолжить.
+        Отдельная клавиша «стоп» стоит там, где раньше была пауза.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self.record_button = QPushButton()
+        self.record_button.setMinimumHeight(44)
+        self.record_button.setMinimumWidth(110)
+        self.record_button.setIcon(icon("play"))
+        self.record_button.setIconSize(QSize(22, 22))
+        self.record_button.setToolTip("Начать запись")
+        row.addWidget(self.record_button)
+
+        self.stop_button = QPushButton()
+        self.stop_button.setMinimumHeight(44)
+        self.stop_button.setMinimumWidth(110)
+        self.stop_button.setIcon(icon("stop"))
+        self.stop_button.setIconSize(QSize(22, 22))
+        self.stop_button.setToolTip("Остановить запись и сохранить файл")
+        self.stop_button.setEnabled(False)
+        row.addWidget(self.stop_button)
+
+        self.cancel_button = QPushButton()
+        self.cancel_button.setMinimumHeight(44)
+        self.cancel_button.setMinimumWidth(110)
+        self.cancel_button.setIcon(icon("cancel"))
+        self.cancel_button.setIconSize(QSize(22, 22))
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setToolTip("Записать заново, файл не сохранится")
+        row.addWidget(self.cancel_button)
+
+        row.addStretch(1)
+
+        self.zone_button = QPushButton()
+        self.zone_button.setMinimumHeight(44)
+        self.zone_button.setMinimumWidth(110)
+        self.zone_button.setIcon(icon("open"))
+        self.zone_button.setIconSize(QSize(22, 22))
+        self.zone_button.setCheckable(True)
+        self.zone_button.setToolTip(
+            "Показать или скрыть список записей и распознанный текст"
+        )
+        row.addWidget(self.zone_button)
+
+        return row
+
+    def _build_level(self) -> QWidget:
+        """Индикатор записи: точка, состояние, таймер и уровень."""
+        self.indicator = RecordIndicator()
+        return self.indicator
+
+    def _build_list_row(self) -> QHBoxLayout:
+        """Таблица записей и кнопки работы с ними.
+
+        Кнопки стоят столбиком: в ряд они растягивались на всю ширину
+        зоны и отжимали таблицу, хотя нужны редко. Распознавание
+        живёт здесь же — оно работает с записями из таблицы, а не
+        с самим микрофоном.
+
+        Подписи «Записи» нет: таблица и так видна, а надпись
+        занимала бы место и выглядела лишней.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self.record_table = QTableWidget(0, len(COLUMN_NAMES))
+        self.record_table.setHorizontalHeaderLabels(COLUMN_NAMES)
+        self.record_table.verticalHeader().setVisible(False)
+        self.record_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.record_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.record_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.record_table.verticalHeader().setDefaultSectionSize(26)
+        self.record_table.setAlternatingRowColors(False)
+
+        # Шапка живёт отдельно от строк и при прокрутке не уезжает —
+        # так и задумано в QTableWidget. Высоту не задаём: с отступами
+        # из стилей ей нужна больше, чем считает Qt по умолчанию,
+        # и при фиксированной высоте заголовки обрезаются
+        header = self.record_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setHighlightSections(False)
+        # Высоту не задаём жёстко: с отступами из стилей Qt считает
+        # её сам иначе заголовки обрезаются. Нижняя граница нужна
+        # только чтобы шапка не схлопнулась совсем.
+        header.setMinimumHeight(40)
+        # По умолчанию Qt прижимает текст к верху, а у нас он
+        # должен стоять посередине полосы
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        )
+
+        # Тянется только «Файл»: остальные колонки берут ровно столько,
+        # сколько нужно под своё содержимое. Иначе имя файла
+        # делится с «Папкой» и обрезается на самом важном месте
+        for fixed in (COLUMN_BLOCK, COLUMN_STATUS, COLUMN_LENGTH, COLUMN_SIZE):
+            header.setSectionResizeMode(fixed, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.record_table.cellDoubleClicked.connect(self._open_row_file)
+
+        self.record_table.setMaximumHeight(170)
+        row.addWidget(self.record_table, 1)
+
+        folder = QVBoxLayout()
+        folder.setSpacing(6)
+
+        self.transcribe_button = PulseButton()
+        self.transcribe_button.setText("Распознать")
+        self.transcribe_button.setMinimumHeight(40)
+        self.transcribe_button.setMinimumWidth(150)
+        self.transcribe_button.setToolTip(
+            "Расшифровать последнюю запись без готового текста"
+        )
+        folder.addWidget(self.transcribe_button)
+
+        self.choose_folder_button = QPushButton("Сменить папку…")
+        self.choose_folder_button.setMinimumHeight(40)
+        self.choose_folder_button.clicked.connect(self._choose_folder)
+        folder.addWidget(self.choose_folder_button)
+
+        folder.addStretch(1)
+        row.addLayout(folder)
+
+        return row
+
+    def _build_text_panel(self) -> QWidget:
+        """Панель с распознанным текстом.
+
+        Сама себя не прячет: её показывает и прячет вторая зона,
+        иначе получилось бы два переключателя на одном экране.
+        """
+        self.text_panel = QFrame()
+        self.text_panel.setFrameShape(QFrame.Shape.NoFrame)
+        self.text_panel.setProperty("panel", True)
+
+        layout = QVBoxLayout(self.text_panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        self.text_header = QLabel("Текст распознавания")
+        self.text_header.setProperty("heading", True)
+        header.addWidget(self.text_header)
+
+        self.dirty_label = QLabel("есть несохранённые правки")
+        self.dirty_label.setProperty("warning", True)
+        self.dirty_label.setVisible(False)
+        header.addWidget(self.dirty_label)
+
+        header.addStretch(1)
+
+        self.save_button = QPushButton("Сохранить")
+        self.save_button.setToolTip("Записать правки обратно в файлы .txt")
+        header.addWidget(self.save_button)
+
+        self.save_as_button = QPushButton("Сохранить как")
+        self.save_as_button.setToolTip("Сохранить текст из окна отдельным файлом")
+        header.addWidget(self.save_as_button)
+
+        self.copy_button = QPushButton("Скопировать в буфер")
+        self.copy_button.setToolTip(
+            "Скопировать выделенное, а если ничего не выделено — весь текст"
+        )
+        header.addWidget(self.copy_button)
+
+        self.clear_button = QPushButton("Очистить")
+        header.addWidget(self.clear_button)
+
+        layout.addLayout(header)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText(
+            "Здесь появляется распознанный текст.\nТекст можно править перед отправкой."
+        )
+        self.text_edit.setMinimumHeight(170)
+        self.text_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        layout.addWidget(self.text_edit)
+
+        # Значок копирования включается, только когда есть что копировать
+        self.text_edit.textChanged.connect(self._update_copy_button)
+        self._update_copy_button()
+
+        return self.text_panel
+
+    def _update_copy_button(self) -> None:
+        """Кнопка копирования гаснет на пустом тексте."""
+        self.copy_button.setEnabled(bool(self.text_edit.toPlainText().strip()))
+
+    def _connect(self) -> None:
+        """Кнопки и сигналы."""
+        self.record_button.clicked.connect(self._toggle_record)
+        self.stop_button.clicked.connect(self._stop_record)
+        self.cancel_button.clicked.connect(self._cancel_record)
+        self.transcribe_button.clicked.connect(self._transcribe)
+
+        self.save_button.clicked.connect(self._save_blocks)
+        self.save_as_button.clicked.connect(self._save_as_file)
+        self.copy_button.clicked.connect(self._copy_to_clipboard)
+        self.clear_button.clicked.connect(self._clear_text)
+        self.zone_button.clicked.connect(self._toggle_zone)
+
+        self.text_edit.textChanged.connect(self._on_text_changed)
+
+        self.signals.recorded.connect(self._on_recorded)
+        self.signals.nothing_recorded.connect(self._on_nothing_recorded)
+        self.signals.record_failed.connect(self._on_error)
+        self.signals.cancelled.connect(self._on_cancelled)
+
+        self.signals.model_ready.connect(self._on_model_ready)
+        self.signals.model_failed.connect(self._on_model_failed)
+
+        self.signals.file_started.connect(self._on_file_started)
+        self.signals.file_done.connect(self._on_file_done)
+        self.signals.all_done.connect(self._on_all_done)
+        self.signals.transcribe_failed.connect(self._on_error)
+
+    # -------------------------------------------------------------- наполнение
+
+    def _fill_devices(self) -> None:
+        """Пустое место на время проверки микрофонов."""
+        self.device_box.clear()
+        self.device_box.addItem("Проверяю микрофоны…", None)
+        self.device_box.setEnabled(False)
+        self.record_button.setEnabled(False)
+
+    def _start_device_probe(self) -> None:
+        """Проверка микрофонов по одному устройству за такт.
+
+        Проверять можно только из главного потока: WASAPI из фонового
+        не открывается. Чтобы окно не замирало, устройства проверяются
+        по очереди, между нимиQt успевает обработать события.
+
+        Нужна один раз при запуске: устройства могут быть отключены,
+        переименованы или отвалиться при смене USB-порта.
+        """
+        try:
+            self._candidates = candidate_devices()
+        except Exception:  # noqa: BLE001 - PortAudio поднимает всё подряд
+            self._candidates = []
+
+        self._working: list[tuple[int, str]] = []
+        self._probe_index = 0
+
+        if not self._candidates:
+            self._on_devices_ready([])
+            return
+
+        self._probe_timer = QTimer(self)
+        self._probe_timer.timeout.connect(self._probe_tick)
+        self._probe_timer.start(1)
+
+    def _probe_tick(self) -> None:
+        """Одна проверка за такт."""
+        if self._probe_index >= len(self._candidates):
+            self._probe_timer.stop()
+            self._on_devices_ready(self._working)
+            return
+
+        index, name = self._candidates[self._probe_index]
+        self._probe_index += 1
+
+        if test_device(index):
+            self._working.append((index, name))
+
+    def _on_devices_ready(self, devices) -> None:
+        """Заполняет список проверенными микрофонами."""
+        self.device_box.clear()
+        self.device_box.setEnabled(True)
+
+        if not devices:
+            self.device_box.addItem("Микрофон не найден", None)
+            self.record_button.setEnabled(False)
+            self._say("Работающих микрофонов не найдено", WARNING)
+            return
+
+        preferred = self.settings.microphone
+        chosen = preferred if preferred is not None else default_device(devices)
+
+        for index, name in devices:
+            self.device_box.addItem(name, index)
+
+        if chosen is not None:
+            position = self.device_box.findData(chosen)
+            if position >= 0:
+                self.device_box.setCurrentIndex(position)
+
+        self.record_button.setEnabled(True)
+        skipped = len(self._candidates) - len(devices)
+        suffix = f", отброшено {skipped}" if skipped > 0 else ""
+        self._say(f"Микрофонов готово: {len(devices)}{suffix}")
+
+    def _fill_models(self) -> None:
+        position = self.model_box.findData(self.settings.model)
+        if position >= 0:
+            self.model_box.setCurrentIndex(position)
+
+    def _refresh_list(self, announce: bool = True) -> None:
+        """Перечитывает записи текущего блока с диска.
+
+        Порядок хронологический: старые сверху, новые снизу. Список
+        читается как журнал, а свежая запись всегда внизу — и
+        программа сама прокручивает к ней.
+
+        Показывается только тот блок, название которого сейчас в
+        поле: в таблице лежат файлы одного блока, а не всех сразу.
+        Иначе блоки перемешиваются и непонятно, где чьи записи.
+
+        announce выключается при наборе названия: сообщение о
+        количестве записей мигало бы на каждой букве.
+        """
+        block = self._current_block()
+        recordings = [
+            item for item in storage.scan(self.recordings) if item.block_folder == block
+        ]
+
+        self.record_table.setRowCount(len(recordings))
+
+        # scan() отдаёт от свежих к старым, таблице нужен обратный порядок
+        for row_number, item in enumerate(reversed(recordings)):
+            self._fill_row(row_number, item)
+
+        # Показываем последнюю запись: она внизу после разворота
+        self.record_table.scrollToBottom()
+
+        pending = sum(1 for item in recordings if not item.has_text)
+
+        if announce:
+            self._say(
+                f"Блок «{block}»: записей {len(recordings)}, без текста {pending}"
+            )
+
+        self._update_transcribe_button()
+
+    def _fill_row(self, row_number: int, item: storage.Recording) -> None:
+        """Заполняет одну строку таблицы."""
+        cells = [
+            item.block or storage.NO_BLOCK,
+            item.name,
+            item.status,
+            item.length,
+            f"{item.size_mb:.1f} МБ",
+        ]
+        hints = [
+            None,
+            "Двойной щелчок — открыть запись в проигрывателе",
+            "Двойной щелчок — открыть текст в блокноте"
+            if item.has_text
+            else "Запись ещё не распознана",
+            "Длительность записи в минутах и секундах",
+            "Размер файла записи в мегабайтах",
+        ]
+
+        for column, value in enumerate(cells):
+            cell = QTableWidgetItem(value)
+            if hints[column]:
+                cell.setToolTip(hints[column])
+
+            if column == COLUMN_BLOCK:
+                # Путь хранится в данных ячейки: он нужен при выборе
+                # строки и при двойном щелчке, а всплывающая
+                # подсказка исчезает
+                cell.setData(Qt.ItemDataRole.UserRole, str(item.wav))
+            elif column == COLUMN_STATUS:
+                # Цветом сразу видно, что ещё не распознано
+                color = QColor(LIVE if item.has_text else MUTED)
+                cell.setForeground(QBrush(color))
+
+            self.record_table.setItem(row_number, column, cell)
+
+    def _open_row_file(self, row: int, column: int) -> None:
+        """Двойной щелчок открывает файл как обычно в Windows.
+
+        По имени записи открывается сам звук — его возьмёт
+        проигрыватель, назначенный системой. По имени текстового
+        файла — блокнот. В остальных колонках щелчок ничего не делает.
+        """
+        if column not in (COLUMN_FILE, COLUMN_STATUS):
+            return
+
+        first = self.record_table.item(row, COLUMN_BLOCK)
+        if first is None:
+            return
+
+        wav = Path(first.data(Qt.ItemDataRole.UserRole))
+        target = wav if column == COLUMN_FILE else wav.with_suffix(".txt")
+
+        if not target.is_file():
+            self._say(f"Файла нет: {target.name}", ERROR)
+            return
+
+        try:
+            # startfile открывает файл программой по умолчанию для
+            # этого расширения: звук — проигрывателем, txt — блокнотом
+            os.startfile(target)  # noqa: S606 - путь из таблицы, shell тут не нужен
+        except OSError as error:
+            self._say(f"Не удалось открыть: {error}", ERROR)
+            return
+
+        self._say(f"Открыт {target.name}", SUCCESS)
+
+    def _set_transcribe_caption(self, text: str) -> None:
+        """Надпись на кнопке распознавания."""
+        self.transcribe_button.setText(text)
+
+    def _update_transcribe_button(self) -> None:
+        """Кнопка «Распознать».
+
+        Пока идёт распознавание, кнопка остаётся нажимаемой: ею
+        прерывают работу. Выключать её нельзя — тогда исчез бы
+        и перелив, и способ остановить распознавание.
+        """
+        if self.transcriber.is_busy:
+            self.transcribe_button.setEnabled(True)
+            self._set_transcribe_caption("Остановить")
+            return
+
+        recorder = self.recorder
+        recording = recorder.is_recording if recorder is not None else False
+        has_pending = bool(
+            storage.pending(self.recordings, block=self._current_block())
+        )
+
+        self.transcribe_button.setEnabled(has_pending and not recording)
+        self._set_transcribe_caption("Распознать")
+
+    # ----------------------------------------------------------------- запись
+
+    def _ensure_recorder(self) -> Recorder:
+        """Запись создаётся один раз и живёт вместе с окном."""
+        if getattr(self, "_recorder", None) is None:
+            self._recorder = Recorder(
+                on_finished=lambda path, dur, peak: self.signals.recorded.emit(
+                    str(path), dur, peak
+                ),
+                on_empty=self.signals.nothing_recorded.emit,
+                on_cancelled=self.signals.cancelled.emit,
+            )
+        return self._recorder
+
+    @property
+    def recorder(self) -> Recorder:
+        return getattr(self, "_recorder", None)
+
+    def _toggle_record(self) -> None:
+        """Одна клавиша на три состояния: начать, пауза, продолжить."""
+        recorder = self._ensure_recorder()
+
+        if recorder.is_recording:
+            recorder.toggle_pause()
+            self._update_record_ui()
+            return
+
+        block = self.block_input.text().strip()
+        target = storage.unique_path(self.recordings, block)
+
+        device = self.device_box.currentData()
+        try:
+            recorder.start(target, device)
+        except Exception as error:  # noqa: BLE001 - причина показывается внизу
+            # Поток звука открывается сразу, поэтому ошибка видна тут же
+            self._say(f"Не удалось начать запись: {error}", ERROR)
+            return
+
+        self._set_recording_ui(True)
+        self._say(f"Идёт запись → {target.name}")
+
+    def _stop_record(self) -> None:
+        """Останавливает запись и сразу сохраняет файл.
+
+        Подтверждение не нужно: потерять запись из-за лишнего
+        вопроса дороже, чем получить лишний файл на диске.
+        """
+        recorder = self._ensure_recorder()
+        if not recorder.is_recording:
+            return
+
+        recorder.stop()
+        self._set_recording_ui(False)
+        self._say("Сохраняю запись…")
+
+    def _cancel_record(self) -> None:
+        self._ensure_recorder().cancel()
+        self._set_recording_ui(False)
+
+    def _set_recording_ui(self, recording: bool) -> None:
+        """Кнопки и индикатор во время записи и после неё."""
+        self.stop_button.setEnabled(recording)
+        self.cancel_button.setEnabled(recording)
+
+        if not recording:
+            self.indicator.reset()
+
+        self._update_record_ui()
+        self._update_transcribe_button()
+
+    def _update_record_ui(self) -> None:
+        """Значок на клавише старта и состояние индикатора."""
+        recorder = self.recorder
+        recording = recorder is not None and recorder.is_recording
+        paused = recording and recorder.is_paused
+
+        if not recording:
+            self.record_button.setIcon(icon("play"))
+            self.record_button.setToolTip("Начать запись")
+            self.indicator.set_state(IDLE)
+        elif paused:
+            self.record_button.setIcon(icon("play"))
+            self.record_button.setToolTip("Продолжить запись")
+            self.indicator.set_state(PAUSED)
+            self._say("Пауза — нажмите ту же клавишу, чтобы продолжить")
+        else:
+            self.record_button.setIcon(icon("pause"))
+            self.record_button.setToolTip("Пауза")
+            self.indicator.set_state(RECORDING)
+
+    def _on_recorded(self, path: str, duration: float, peak: float) -> None:
+        self._set_recording_ui(False)
+        self._refresh_list()
+
+        message = f"Готово: {Path(path).name}  ({format_duration(duration)})"
+        if peak < 0.01:
+            message += "  — звук почти не записан"
+        self._say(message, SUCCESS)
+
+    def _on_nothing_recorded(self) -> None:
+        self._set_recording_ui(False)
+        self._say("Звука не было, файл не создан", WARNING)
+
+    def _on_error(self, message: str) -> None:
+        """Ошибка из рабочего потока: показываем текстом в строке состояния."""
+        self._say(f"Ошибка: {message}", ERROR)
+        self._set_recording_ui(False)
+        self._update_transcribe_button()
+
+    def _on_cancelled(self) -> None:
+        self._set_recording_ui(False)
+        self._say("Запись отменена, файл не сохранён", WARNING)
+
+    # ------------------------------------------------------------ распознавание
+
+    def _start_model(self) -> None:
+        """Модель грузится один раз, сразу при запуске."""
+        self._say("Загружаю модель, первый раз это долго…")
+        self.model_store.load_async(
+            self.settings.model,
+            on_done=lambda _model: self.signals.model_ready.emit(),
+            on_error=lambda err: self.signals.model_failed.emit(str(err)),
+        )
+
+    def _on_model_ready(self) -> None:
+        self._say("Модель готова", SUCCESS)
+        self._update_transcribe_button()
+
+    def _on_model_failed(self, error: str) -> None:
+        self._say(f"Не удалось загрузить модель: {error}", ERROR)
+        self._update_transcribe_button()
+
+    def _transcribe(self) -> None:
+        """Расшифровывает последнюю запись без готового текста.
+
+        Повторный щелчок по кнопке прерывает распознавание: пока
+        идёт работа, шкала лежит поверх кнопки, но мышь проходит
+        насквозь и попадает в кнопку.
+        """
+        if self.transcriber.is_busy:
+            self.transcriber.cancel()
+            self._say("Останавливаю распознавание…", WARNING)
+            return
+
+        waiting = storage.pending(self.recordings, block=self._current_block())
+        if not waiting:
+            self._say("Нечего распознавать: все записи уже с текстом", WARNING)
+            return
+
+        target = waiting[0]
+        self._say(f"Распознаю {target.name}")
+        self._pulse_start("Распознаю…")
+
+        started = self.transcriber.start(
+            [target.wav],
+            self.model_box.currentData(),
+            on_file_start=lambda wav: self.signals.file_started.emit(str(wav)),
+            on_file_done=lambda wav, lines, text: self.signals.file_done.emit(
+                str(wav), lines, text
+            ),
+            on_all_done=lambda done, total, stopped: self.signals.all_done.emit(
+                done, total, stopped
+            ),
+            on_error=lambda err: self.signals.transcribe_failed.emit(str(err)),
+        )
+
+        if started:
+            self._update_transcribe_button()
+
+    def _pulse_start(self, caption: str) -> None:
+        """Кнопка распознавания переливается, пока идёт работа.
+
+        Подпись показывает, какой файл разбирается: при записи
+        подлиннее первые куски приходят не сразу, и без имени
+        пауза выглядит зависанием.
+        """
+        self.transcribe_button.start_pulse()
+        self.transcribe_button.setToolTip(caption)
+
+    def _pulse_stop(self) -> None:
+        self.transcribe_button.stop_pulse()
+        self.transcribe_button.setToolTip(
+            "Расшифровать последнюю запись без готового текста"
+        )
+
+    def _on_file_started(self, wav: str) -> None:
+        self._pulse_start(f"Распознаю {Path(wav).name}…")
+        self._say(f"Распознаю {Path(wav).name}, это займёт время")
+
+    def _on_file_done(self, wav: str, lines: int, text: str) -> None:
+        self._append_text(Path(wav), text)
+        self._refresh_list()
+
+        if lines == 0:
+            self._say(f"{Path(wav).name}: речь не распознана", WARNING)
+        else:
+            self._say(f"{Path(wav).name}: готово, строк {lines}", SUCCESS)
+
+    def _on_all_done(self, done: int, total: int, stopped: bool) -> None:
+        self._pulse_stop()
+        self._update_transcribe_button()
+        if stopped:
+            # Файла не осталось: прервали на середине и ничего не записали
+            self._say(
+                "Остановил. Текст не сохранён — запись можно распознать заново",
+                WARNING,
+            )
+        else:
+            remaining = len(storage.pending(self.recordings))
+            suffix = f", осталось без текста: {remaining}" if remaining else ""
+            self._say(f"Распознано файлов: {done}{suffix}", SUCCESS)
+
+    # ------------------------------------------------------------------ текст
+
+    def _append_text(self, wav: Path, text: str) -> None:
+        """Добавляет распознанный текст в окно и запоминает, откуда он."""
+        title = storage.block_of(self.recordings, wav) or storage.NO_BLOCK
+        when = storage.parse_when(wav.stem)
+        # Секунды в разделителе: две записи в одну минуту должны
+        # остаться разными кусками
+        stamp = when.strftime("%d.%m.%Y %H:%M:%S") if when else "—"
+        separator = f"── {stamp} · {title} ──"
+
+        self._appending = True
+        self.text_edit.appendPlainText(separator)
+        self.text_edit.appendPlainText("")
+        self.text_edit.appendPlainText(text)
+        self._appending = False
+
+        self.blocks.append(TextBlock(wav=wav, separator=separator))
+        self.dirty = False
+        self._update_dirty()
+
+        # Зона открывается сама: результат распознавания иначе
+        # негде увидеть, а нажатие кнопки «Распознать» было только что
+        self._show_zone()
+
+    def _on_text_changed(self) -> None:
+        """Правка пользователя делает окно несохранённым."""
+        if self._appending or self.dirty:
+            return
+        self.dirty = True
+        self._update_dirty()
+
+    def _update_dirty(self) -> None:
+        self.dirty_label.setVisible(self.dirty)
+        self.save_button.setEnabled(self.dirty)
+
+    def _save_blocks(self) -> None:
+        """Пишет правки из окна обратно в файлы .txt.
+
+        Куски разбираются по разделителям в текущем тексте окна,
+        поэтому правки в любом месте не сбивают границы.
+        """
+        if not self.blocks:
+            return
+
+        content = self.text_edit.toPlainText()
+
+        # Где начинается каждый кусок
+        starts: list[int] = []
+        cursor = 0
+        for block in self.blocks:
+            found = content.find(block.separator, cursor)
+            if found < 0:
+                break  # разделитель удалён — этот кусок уже не отделить
+            starts.append(found)
+            cursor = found + len(block.separator)
+
+        if not starts:
+            self._say("Не найдены разделители, куски не разделены", WARNING)
+            return
+
+        written = 0
+        for index, block in enumerate(self.blocks[: len(starts)]):
+            start = starts[index]
+
+            # Тело куска начинается после строки-разделителя
+            line_end = content.find("\n", start)
+            body_start = line_end + 1 if line_end >= 0 else len(content)
+
+            body_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+
+            chunk = content[body_start:body_end].strip()
+            block.wav.with_suffix(".txt").write_text(chunk, encoding="utf-8")
+            written += 1
+
+        self.dirty = False
+        self._update_dirty()
+        self._refresh_list()
+        self._say(f"Правки записаны в файлы: {written}", SUCCESS)
+
+    def _save_as_file(self) -> None:
+        """Сохраняет содержимое окна отдельным файлом."""
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            self._say("В окне нет текста", WARNING)
+            return
+
+        target, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить текст",
+            str(self.recordings / "текст.txt"),
+            "Текстовые файлы (*.txt);;Все файлы (*)",
+        )
+        if not target:
+            return
+
+        try:
+            Path(target).write_text(text, encoding="utf-8")
+        except OSError as error:
+            self._say(f"Не удалось сохранить: {error}", ERROR)
+            return
+
+        self._say(f"Сохранено: {target}", SUCCESS)
+
+    def _copy_text(self) -> None:
+        """Копирует в буфер обмена.
+
+        Если выделен кусок — только он, иначе весь текст из окна.
+        Так же работает и кнопка, и значок в углу поля.
+        """
+        cursor = self.text_edit.textCursor()
+
+        if cursor.hasSelection():
+            # QTextCursor отдаёт абзацы символом перевода строки
+            text = cursor.selectedText().replace(" ", "\n")
+        else:
+            text = self.text_edit.toPlainText().strip()
+
+        if not text:
+            self._say("В окне нет текста", WARNING)
+            return
+
+        QApplication.clipboard().setText(text)
+        self._say(f"Скопировано в буфер обмена: {len(text)} символов", SUCCESS)
+
+    def _copy_to_clipboard(self) -> None:
+        """Кнопка «Копировать»: то же, что делает значок в углу."""
+        self._copy_text()
+
+    def _clear_text(self) -> None:
+        """Очищает окно. Файлы на диске остаются."""
+        if self.dirty and not self._ask_save("Очистить окно?"):
+            return
+
+        self._appending = True
+        self.text_edit.clear()
+        self._appending = False
+
+        self.blocks.clear()
+        self.dirty = False
+        self._update_dirty()
+        self._say("Окно очищено, файлы на диске сохранились", SUCCESS)
+
+    def _measure(self, zone_limit: int) -> int:
+        """Высота окна при заданной высоте зоны.
+
+        Пока зона свёрнута, её размер не посчитать, поэтому на миг
+        снимаем ограничение, меряем и возвращаем как было.
+        """
+        saved = self.details_zone.maximumHeight()
+        self.details_zone.setMaximumHeight(zone_limit)
+        self.centralWidget().adjustSize()
+        needed = self.centralWidget().sizeHint().height()
+        self.details_zone.setMaximumHeight(saved)
+        return needed
+
+    def _stationary_height(self) -> int:
+        """Высота окна без второй зоны: только запись."""
+        return self._measure(0)
+
+    def _zone_height(self) -> int:
+        """Высота зоны, когда она раскрыта.
+
+        Ограничена экраном, а не половиной окна: окно само
+        подрастает под зону, поэтому резать её не нужно.
+        """
+        screen = QApplication.primaryScreen()
+        limit = screen.availableGeometry().height() - 140 if screen else 700
+
+        saved = self.details_zone.maximumHeight()
+        self.details_zone.setMaximumHeight(16777215)
+        self.details_zone.adjustSize()
+        needed = self.details_zone.sizeHint().height()
+        self.details_zone.setMaximumHeight(saved)
+
+        return min(needed, max(200, limit))
+
+    def _fit_window(self) -> None:
+        """Подгоняет высоту окна под то, что сейчас показано.
+
+        Вызывается, когда анимация зоны дошла до конца: окно должно
+        ужиматься вместе с ней, иначе под индикатором остаётся пустота.
+        """
+        if self.details_zone.maximumHeight() > 0:
+            target = self._measure(16777215)
+            # Зона только что раскрылась: полоса прокрутки таблицы
+            # появилась вместе с ней, до этого прокручивать некуда
+            self.record_table.scrollToBottom()
+        else:
+            target = self._stationary_height()
+
+        screen = QApplication.primaryScreen()
+        limit = screen.availableGeometry().height() - 90 if screen else 800
+
+        self.resize(self.width(), max(300, min(target, limit)))
+
+    def _toggle_zone(self) -> None:
+        """Кнопка «Записи и текст»: открыть или закрыть зону.
+
+        У checkable-кнопки состояние меняется до вызова слота,
+        поэтому здесь оно уже новое — смотрим на него.
+        """
+        if self.zone_button.isChecked():
+            self._show_zone()
+        else:
+            self._hide_zone()
+
+    def _show_zone(self) -> None:
+        self.zone_button.setChecked(True)
+        self.zone_button.setToolTip("Скрыть записи и текст распознавания")
+
+        start = self.details_zone.maximumHeight()
+        self._zone_animation.stop()
+        self._zone_animation.setStartValue(start)
+        self._zone_animation.setEndValue(self._zone_height())
+        self._zone_animation.start()
+
+    def _hide_zone(self) -> None:
+        self.zone_button.setChecked(False)
+        self.zone_button.setToolTip("Записи и текст распознавания")
+
+        self._zone_animation.stop()
+        self._zone_animation.setStartValue(self.details_zone.maximumHeight())
+        self._zone_animation.setEndValue(0)
+        self._zone_animation.start()
+
+    # ------------------------------------------------------------------ папка
+
+    def _choose_folder(self) -> None:
+        """Переход в другой блок.
+
+        Папка рядом с текущими блоками — это сам блок: подставляем
+        её название в поле, и туда едут таблица и новые записи.
+        Папка снаружи — это новый корень для записей целиком.
+
+        Раньше любую выбранную папку приложение делало корнем, и
+        папку блока можно было выбрать по ошибке — тогда блоки
+        начинали вкладываться друг в друга.
+        """
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Папка для записей", str(self.recordings)
+        )
+        if not chosen:
+            return
+
+        path = Path(chosen)
+
+        # Прямой потомок корня записей — это папка блока
+        if path.parent == self.recordings:
+            self.block_input.setText(path.name)
+            self._update_block_hint()
+            self._refresh_list()
+            self._say(f"Открыт блок {path.name}", SUCCESS)
+            return
+
+        if config.looks_nested(path):
+            answer = QMessageBox.question(
+                self,
+                "Похоже, выбрана папка блока",
+                f"{chosen}\n\n"
+                "Эта папка лежит внутри папки записей, но не является "
+                "её блоком. Если сделать её корнем, записи лягут ещё "
+                "на уровень глубже.\n\n"
+                "Всё равно выбрать её корнем?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self.settings.recordings_dir = chosen
+        self.settings.save()
+        self.recordings = self.settings.recordings_path()
+        self._update_block_hint()
+        self._refresh_list()
+        self._say(f"Записи теперь в: {chosen}", SUCCESS)
+
+    # -------------------------------------------------------------- таймер
+
+    def _tick_timer(self) -> None:
+        """Уровень и таймер обновляются одним тикером.
+
+        Отдельные сигналы на каждый фрагмент звука забили бы очередь
+        событий: PortAudio даёт их тысячи раз в секунду.
+        """
+        timer = QTimer(self)
+        timer.timeout.connect(self._on_tick)
+        timer.start(UI_TICK_MS)
+        self._ui_timer = timer
+
+    def _on_tick(self) -> None:
+        """Забирает свежие данные записи и обновляет индикатор."""
+        recorder = getattr(self, "_recorder", None)
+        if recorder is None or not recorder.is_recording:
+            return
+
+        self.indicator.set_elapsed(recorder.elapsed)
+        self.indicator.set_level(recorder.level)
+
+    def showEvent(self, event) -> None:
+        """При первом показе окно ужимается под содержимое.
+
+        Зона свёрнута, и без этого окно открывается в полный размер
+        с пустым местом внизу. Дальше размером управляет анимация.
+        """
+        super().showEvent(event)
+        if not getattr(self, "_fitted_once", False):
+            self._fitted_once = True
+            self._fit_window()
+
+    # ---------------------------------------------------------------- выход
+
+    def _ask_save(self, title: str) -> bool:
+        """Спрашивает про несохранённые правки. True — можно закрывать."""
+        answer = QMessageBox.question(
+            self,
+            title,
+            "В окне есть несохранённые правки.\nСохранить их в файлы?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+
+        if answer == QMessageBox.StandardButton.Save:
+            self._save_blocks()
+
+        return True
+
+    def closeEvent(self, event) -> None:
+        """Перед выходом: закрыть запись и спросить про правки."""
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None and recorder.is_recording:
+            recorder.stop()
+            recorder.cancel()
+
+        if self.transcriber.is_busy:
+            self.transcriber.cancel()
+
+        if self.dirty and not self._ask_save("Выход"):
+            event.ignore()
+            return
+
+        self.settings.last_block = self.block_input.text().strip()
+        self.settings.microphone = self.device_box.currentData()
+        self.settings.model = self.model_box.currentData()
+        self.settings.save()
+
+        event.accept()
+
+
+def run() -> int:
+    """Запуск приложения."""
+    app = QApplication(sys.argv)
+    app.setApplicationName("SmartVoiceRecorder")
+    apply_locale(app)
+    apply_theme(app)
+
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
+    window = MainWindow()
+    window.show()
+
+    return app.exec()
