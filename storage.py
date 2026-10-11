@@ -72,6 +72,7 @@ class Recording:
     has_text: bool
     size_mb: float
     duration: float = 0.0
+    modified: float = 0.0
 
     @property
     def txt(self) -> Path:
@@ -183,10 +184,13 @@ def scan(root: Path) -> list[Recording]:
                 has_text=wav.with_suffix(".txt").exists(),
                 size_mb=stat.st_size / 1024 / 1024,
                 duration=read_duration(wav),
+                modified=stat.st_mtime,
             )
         )
 
-    return sorted(found, key=lambda r: r.wav.stat().st_mtime, reverse=True)
+    # Время берём из уже сделанного stat: повторный вызов без защиты
+    # мог бы упасть, если файл исчез между обходом и сортировкой
+    return sorted(found, key=lambda r: r.modified, reverse=True)
 
 
 def pending(root: Path, block: str | None = None) -> list[Recording]:

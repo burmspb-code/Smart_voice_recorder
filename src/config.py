@@ -93,19 +93,23 @@ def default_recordings_dir() -> Path:
     return project_root() / "recordings"
 
 
-def looks_nested(candidate: Path) -> bool:
+def looks_nested(candidate: Path, root: Path) -> bool:
     """Похоже, что выбрали папку внутри корня записей.
+
+    root — текущий корень записей, а не папка по умолчанию: если
+    пользователь уже сменил корень, проверка идёт от него.
 
     Если так сделать, папки блоков лягут ещё на уровень глубже:
     recordings/идея/идея. Такое легко получить, выбрав в диалоге
     папку, которая сама является папкой блока.
     """
     try:
-        inside = candidate.resolve().is_relative_to(default_recordings_dir().resolve())
+        resolved = candidate.resolve()
+        root_resolved = root.resolve()
     except OSError, ValueError:
         return False
 
-    return inside and candidate.resolve() != default_recordings_dir().resolve()
+    return resolved.is_relative_to(root_resolved) and resolved != root_resolved
 
 
 def project_root() -> Path:

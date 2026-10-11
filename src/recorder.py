@@ -18,6 +18,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,14 @@ import sounddevice as sd
 SAMPLE_RATE = 48000
 CHANNELS = 1
 DTYPE = "int16"
+
+# Запись может идти часами, поэтому звук в памяти не копим: как только
+# буфер набрал SPILL_SECONDS звука, поток-сохраняльщик дописывает его
+# в черновой файл рядом с будущей записью. FLUSH_WAKE — как часто он
+# просыпается и смотрит на буфер.
+FLUSH_WAKE = 2.0
+SPILL_SECONDS = 30.0
+SPILL_FRAMES = int(SPILL_SECONDS * SAMPLE_RATE)
 
 # Ниже этого уровня (доля от полной шкалы) подозрительно тихо
 SILENCE_WARNING = 0.01
@@ -181,6 +190,9 @@ class Recorder:
         self._thread: threading.Thread | None = None
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
+        # Черновой файл и то, сколько секунд в него уже сброшено
+        self._spill_path: Path | None = None
+        self._spilled = 0.0
         self._peak = 0.0
         self._level = 0.0
         self._path: Path | None = None
@@ -268,6 +280,8 @@ class Recorder:
 
         self._path = path
         self._frames = []
+        self._spill_path = path.with_suffix(".raw")
+        self._spilled = 0.0
         self._peak = 0.0
         self._level = 0.0
         self._stop.clear()
@@ -342,49 +356,60 @@ class Recorder:
         if not self.is_recording:
             return
 
+        # Порядок важен: сначала гасим колбэк (событие стопа), потом
+        # закрываем звук и ждём, пока поток-сохраняльщик всё выбросит.
         self._cancelled.set()
+        self._stop.set()
         self._paused.clear()
         self._close_stream()
         self._close_segment()
-        self._stop.set()
-
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        self._join_workers()
 
     def stop(self) -> None:
         """Останавливает запись и сохраняет файл."""
         if not self.is_recording:
             return
 
+        # Сначала гасим колбэк — иначе он может успеть добавить пачку
+        # уже после того, как мы решили остановиться (см. _close_stream)
+        self._stop.set()
         self._paused.clear()
-        # Сначала закрываем звук, потом разрешаем сохранять:
-        # так в файл не попадёт половина последней пачки
         self._close_stream()
         self._close_segment()
-        self._stop.set()
+        self._join_workers()
 
+    def _join_workers(self) -> None:
+        """Ждёт, пока фоновый поток закончит сохранять или выбрасывать."""
         if self._thread is not None:
             self._thread.join(timeout=5)
 
     def _wait_worker(self) -> None:
-        """Фоновый поток: ждёт сигнала и сохраняет файл.
+        """Фоновый поток: ждёт стоп и по пути сбрасывает звук на диск.
 
         Звук он не трогает — поток уже закрыт в stop() или cancel().
+        Пока стоп не наступил, просыпается каждые FLUSH_WAKE секунд и
+        переносит накопленное в черновой файл: память держится в рамках
+        SPILL_SECONDS звука при любой длине записи. Потолка по времени
+        нет: как бы долго ни шла запись, стоп будет замечен сразу.
         """
-        self._stop.wait(timeout=300)
+        while not self._stop.wait(FLUSH_WAKE):
+            self._flush_pending()
+
+        # Остаток буфера — тоже в черновик, чтобы сохранять из одного места
+        self._flush_pending(force=True)
 
         if self.on_tick:
             self.on_tick(time.monotonic() - self._started_at)
 
         # Отмена: всё, что накоплено, выбрасывается
         if self._cancelled.is_set():
-            self._frames.clear()
+            self._discard()
             if self.on_cancelled:
                 self.on_cancelled()
             return
 
         # Если остановили, не начав, или звука не было — файла не будет
-        if not self._frames:
+        if not self._frames and self._spilled == 0.0:
             if self.on_empty:
                 self.on_empty()
             return
@@ -403,20 +428,73 @@ class Recorder:
         if self.on_finished:
             self.on_finished(path, self._duration(), self._peak)
 
+    def _flush_pending(self, *, force: bool = False) -> None:
+        """Переносит накопленный звук в черновой файл, если это нужно.
+
+        force забирает всё, что есть в буфере: так в конце вся запись
+        оказывается в одном месте — в черновике, и сохранять можно
+        оттуда напрямую.
+        """
+        if not force:
+            buffered = sum(len(chunk) for chunk in self._frames)
+            if buffered < SPILL_FRAMES:
+                return
+
+        pending, self._frames = self._frames, []
+        if not pending:
+            return
+
+        spill = self._spill_path
+        if spill is None:
+            return
+
+        spill.parent.mkdir(parents=True, exist_ok=True)
+        with spill.open("ab") as raw:
+            raw.write(np.concatenate(pending).tobytes())
+
+        self._spilled += sum(len(chunk) for chunk in pending) / SAMPLE_RATE
+
+    def _discard(self) -> None:
+        """Выбрасывает накопленное: память и черновой файл."""
+        self._frames = []
+        self._spilled = 0.0
+
+        spill = self._spill_path
+        if spill is not None:
+            with suppress(OSError):
+                spill.unlink(missing_ok=True)
+
     def _write(self, path: Path) -> None:
-        audio = np.concatenate(self._frames)
+        """Собирает wav из черновика.
+
+        Звук сбрасывался на диск по частям ещё во время записи
+        (_flush_pending), поэтому итоговый файл переписывается из
+        черновика байт в байт — копить всё в памяти не нужно.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        spill = self._spill_path
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(CHANNELS)
             wav.setsampwidth(2)
             wav.setframerate(SAMPLE_RATE)
-            wav.writeframes(audio.tobytes())
+            if spill is not None and spill.is_file():
+                with spill.open("rb") as raw:
+                    while True:
+                        block = raw.read(1024 * 1024)
+                        if not block:
+                            break
+                        wav.writeframes(block)
+
+        # Черновик сослужил службу — он больше не нужен
+        if spill is not None:
+            with suppress(OSError):
+                spill.unlink(missing_ok=True)
 
     def _duration(self) -> float:
-        if not self._frames:
-            return 0.0
-        return sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        """Сколько секунд записано, включая сброшенное на диск."""
+        buffered = sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        return self._spilled + buffered
 
     def is_too_quiet(self) -> bool:
         """Заметно тихо — похоже, микрофон не тот или выключен."""

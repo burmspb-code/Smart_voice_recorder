@@ -1396,7 +1396,7 @@ class MainWindow(QMainWindow):
             self._say(f"Открыт блок {path.name}", SUCCESS)
             return
 
-        if config.looks_nested(path):
+        if config.looks_nested(path, self.recordings):
             answer = QMessageBox.question(
                 self,
                 "Похоже, выбрана папка блока",
