@@ -9,8 +9,11 @@
 Хранятся в JSON-файле в профиле пользователя Windows:
     %APPDATA%\\SmartVoiceRecorder\\settings.json
 
-Путь к настройкам не зависит от того, откуда запущено приложение:
-из ярлыка, из bat-файла, из PyCharm — файл тот же самый.
+Скачанная модель лежит отдельно, в локальной папке приложения:
+    %LOCALAPPDATA%\\SmartVoiceRecorder\\models
+
+Путь не зависит от того, откуда запущено приложение: из ярлыка,
+из bat-файла, из PyCharm — файлы те же самые.
 """
 
 import json
@@ -20,7 +23,7 @@ from pathlib import Path
 APP_NAME = "SmartVoiceRecorder"
 
 # Модель по умолчанию. medium — 1,5 ГБ, скачивается один раз
-# и дальше лежит в кэше Hugging Face
+# и дальше лежит в локальной папке приложения
 DEFAULT_MODEL = "medium"
 
 # Модели, которые имеет смысл предлагать: тяжёлые, но на русском
@@ -30,6 +33,15 @@ AVAILABLE_MODELS = {
     "base": "base — 145 МБ",
     "small": "small — 460 МБ",
     "medium": "medium — 1,5 ГБ, рекомендуется",
+}
+
+# Примерный размер модели на диске, МБ. Точный размер заранее неизвестен,
+# а порядок величины нужен для сообщения при первой загрузке.
+MODEL_SIZES_MB = {
+    "tiny": 75,
+    "base": 145,
+    "small": 460,
+    "medium": 1500,
 }
 
 
@@ -49,6 +61,31 @@ def settings_dir() -> Path:
 
 def settings_file() -> Path:
     return settings_dir() / "settings.json"
+
+
+def local_app_dir() -> Path:
+    """Локальная папка приложения в профиле пользователя.
+
+    Отдельно от настроек: модель — это большие файлы, которым нечего
+    делать в roaming-профиле (APPDATA), иначе они поедут на сервер
+    вместе с настройками.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / APP_NAME
+
+    # LOCALAPPDATA нет — почти не бывает на Windows, но путь всё равно нужен
+    return Path.home() / "AppData" / "Local" / APP_NAME
+
+
+def models_dir() -> Path:
+    """Папка со скачанной моделью Whisper.
+
+    Не кэш Hugging Face: кэш выглядит одноразовым, его могут удалить
+    как мусор. Модель должна переживать очистку кэша и переклоне
+    проекта, поэтому лежит в профиле пользователя под своим именем.
+    """
+    return local_app_dir() / "models"
 
 
 def default_recordings_dir() -> Path:

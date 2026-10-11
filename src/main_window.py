@@ -51,7 +51,7 @@ from PyQt6.QtWidgets import (
 )
 
 import storage
-from src import config
+from src import config, model_store
 from src.config import AVAILABLE_MODELS, Settings
 from src.core.icons import app_icon, icon
 from src.core.styles import (
@@ -165,6 +165,15 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self._appending = False
 
+        # Сведения о модели: нужны, чтобы первый запуск был понятным
+        self._model_info: model_store.ModelInfo | None = None
+        self._model_needs_download = False
+        self._download_notice_shown = False
+        self._model_moved_from: Path | None = None
+        self._moved_notice_shown = False
+        # Пока модель грузится, строка статуса не перебивается
+        self._model_loading = False
+
         self._build_ui()
         self._connect()
 
@@ -205,6 +214,19 @@ class MainWindow(QMainWindow):
 
     def _say(self, text: str, kind: str = INFO) -> None:
         """Сообщение внизу окна с цветом по смыслу.
+
+        Пока модель грузится, сообщение о загрузке не перебивается
+        обычными сообщениями: иначе оно мелькнёт и пропадёт, а
+        пользователь так и не поймёт, чего ждёт приложение. Ошибкам
+        и предупреждениям дорога открыта — они важнее.
+        """
+        if self._model_loading and kind not in (WARNING, ERROR):
+            return
+
+        self._set_status(text, kind)
+
+    def _set_status(self, text: str, kind: str = INFO) -> None:
+        """Ставит текст статуса напрямую, минуя защиту от перебивания.
 
         Без unpolish и polish Qt не перечитывает правило для нового
         свойства, и подпись осталась бы прежнего цвета.
@@ -899,19 +921,143 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ распознавание
 
     def _start_model(self) -> None:
-        """Модель грузится один раз, сразу при запуске."""
-        self._say("Загружаю модель, первый раз это долго…")
+        """Модель грузится один раз, сразу при запуске.
+
+        До загрузки выясняем, лежит ли модель на диске: от этого зависит
+        и сообщение в строке состояния, и уведомление при первом запуске.
+        """
+        name = self.settings.model
+        self._model_info = model_store.describe(name)
+        self._model_needs_download = not self._model_info.cached
+        self._model_moved_from = self._model_info.moved_from
+        size = model_store.format_size(self._model_info.footprint)
+
+        if self._model_needs_download:
+            message = (
+                f"Скачиваю модель «{name}» из интернета и загружаю в память "
+                "— это делается один раз"
+            )
+        elif self._model_moved_from is not None:
+            message = (
+                f"Перенёс модель «{name}» из старого кэша и загружаю в память ({size})"
+            )
+        else:
+            message = (
+                f"Загружаю модель «{name}» с диска в память ({size}) — интернет не нужен"
+            )
+
+        # Пока модель не готова, это сообщение главное: обычные строки
+        # статуса его не перебивают (см. _say).
+        self._model_loading = True
+        self._set_status(message, INFO)
+
         self.model_store.load_async(
-            self.settings.model,
+            name,
             on_done=lambda _model: self.signals.model_ready.emit(),
             on_error=lambda err: self.signals.model_failed.emit(str(err)),
         )
 
+    def _format_expected_size(self) -> str:
+        """Примерный размер модели на диске с учётом режима кэша.
+
+        В режиме копирования файлы ложатся дважды, поэтому места
+        нужно вдвое больше — это и показываем заранее.
+        """
+        info = self._model_info
+        megabytes = config.MODEL_SIZES_MB.get(info.name, 0)
+        if megabytes and info.duplicates:
+            megabytes *= 2
+        if not megabytes:
+            return "неизвестно"
+        return model_store.format_size(megabytes * 1024 * 1024)
+
+    def _model_mode_text(self) -> str:
+        """Каким способом хранилище держит файлы."""
+        if self._model_info.symlinks:
+            return "симлинки — файлы не дублируются"
+        return "копирование — файлы дублируются (режим разработчика Windows выключен)"
+
+    def _model_mode_hint(self) -> str:
+        """Что даёт режим копирования и как его поправить."""
+        if self._model_info.symlinks:
+            return ""
+        return (
+            "Из-за копирования модель займёт примерно вдвое больше места. "
+            "Вернуть место можно, включив в Windows режим разработчика "
+            "(Параметры → Система → Для разработчиков) и удалив папку модели: "
+            "при следующем запуске модель скачается заново, уже без дублирования."
+        )
+
+    def _announce_download(self) -> None:
+        """Уведомление перед первой загрузкой модели.
+
+        Показывается один раз, когда модели ещё нет на диске. Объясняет,
+        что скачивается, куда, каким способом хранятся файлы и что будет
+        после загрузки.
+        """
+        info = self._model_info
+        parts = [
+            f"Модель «{info.name}» скачивается один раз, из интернета.",
+            "",
+            f"Куда: {info.models_dir}",
+            f"Режим: {self._model_mode_text()}",
+            f"Ожидаемый размер: около {self._format_expected_size()}",
+        ]
+
+        hint = self._model_mode_hint()
+        if hint:
+            parts += ["", hint]
+
+        parts += [
+            "",
+            "Пока идёт загрузка, приложение можно использовать как обычно. "
+            "После неё интернет больше не понадобится: распознавание идёт "
+            "локально, на этом компьютере.",
+        ]
+
+        QMessageBox.information(
+            self, "Первый запуск: скачивается модель", "\n".join(parts)
+        )
+
+    def _announce_move(self) -> None:
+        """Уведомление о переносе модели из старого кэша HF.
+
+        Показывается один раз: раньше модель лежала в общем кэше,
+        теперь живёт в папке приложения, и качать её заново не нужно.
+        """
+        info = self._model_info
+        size = model_store.format_size(info.footprint)
+        QMessageBox.information(
+            self,
+            "Модель переехала",
+            f"Модель «{info.name}» больше не лежит в кэше Hugging Face — "
+            f"я перенёс её в папку приложения:\n\n{info.models_dir}\n\n"
+            f"Занято на диске: {size}. Скачивать заново не нужно: интернет "
+            "уже не понадобится, распознавание идёт локально.",
+        )
+
     def _on_model_ready(self) -> None:
-        self._say("Модель готова", SUCCESS)
+        name = self.settings.model
+        size_text = model_store.format_size(model_store.model_size_on_disk(name))
+        self._model_loading = False
+        self._say(f"Модель «{name}» готова ({size_text} на диске). Работаем офлайн.", SUCCESS)
+
+        # После первой загрузки отдельно сообщаем размер и офлайн-режим
+        if self._model_needs_download:
+            self._model_needs_download = False
+            QMessageBox.information(
+                self,
+                "Модель готова",
+                f"Модель «{name}» скачана и сохранена.\n\n"
+                f"Занято на диске: {size_text}.\n\n"
+                "Интернет больше не нужен: распознавание идёт локально, "
+                "на этом компьютере.",
+            )
+
         self._update_transcribe_button()
 
     def _on_model_failed(self, error: str) -> None:
+        self._model_loading = False
         self._say(f"Не удалось загрузить модель: {error}", ERROR)
         self._update_transcribe_button()
 
@@ -1304,6 +1450,16 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_fitted_once", False):
             self._fitted_once = True
             self._fit_window()
+
+        # Уведомление о первой загрузке показываем уже на экране, а не
+        # до показа окна: иначе диалог появился бы над пустым рабочим
+        # столом, и было бы непонятно, к чему он относится.
+        if self._model_needs_download and not self._download_notice_shown:
+            self._download_notice_shown = True
+            QTimer.singleShot(0, self._announce_download)
+        elif self._model_moved_from is not None and not self._moved_notice_shown:
+            self._moved_notice_shown = True
+            QTimer.singleShot(0, self._announce_move)
 
     # ---------------------------------------------------------------- выход
 

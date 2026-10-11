@@ -26,10 +26,17 @@ NO_BLOCK = "без названия"
 INVALID_CHARS = '<>:"/\\|?*'
 
 
-def format_duration(seconds: float) -> str:
-    """Длительность в виде минут и секунд: 0:07, 12:34."""
+def format_duration(seconds: float, pad: bool = False) -> str:
+    """Длительность в виде минут и секунд: 0:07, 12:34.
+
+    pad=True — минуты с ведущим нулём (00:07): так время показывает
+    таймер записи.
+    """
     total = int(seconds)
-    return f"{total // 60}:{total % 60:02d}"
+    minutes = total // 60
+    if pad:
+        return f"{minutes:02d}:{total % 60:02d}"
+    return f"{minutes}:{total % 60:02d}"
 
 
 def read_duration(wav: Path) -> float:
