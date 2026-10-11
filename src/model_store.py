@@ -171,6 +171,67 @@ def format_size(size: int) -> str:
     return f"{size / 1024**2:.0f} МБ"
 
 
+def _blob_bytes(root: Path) -> int:
+    """Настоящие байты модели в кэше, без дублей из snapshots.
+
+    При симлинках snapshots ссылаются на blobs, при копировании
+    содержат вторую полную копию — и в том и в другом случае
+    считать надо только blobs (и временные файлы докачки).
+    """
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+
+        parts = path.relative_to(root).parts
+        if parts and parts[0] in ("snapshots", "trees"):
+            continue
+
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def downloaded_bytes(name: str) -> int:
+    """Сколько байт модели уже легло на диск.
+
+    Считает только настоящие данные: дубли в snapshots (режим
+    копирования) прогресс не удваивают.
+    """
+    return _blob_bytes(repo_cache_dir(name))
+
+
+_EXPECTED_SIZE: dict[str, int] = {}
+
+
+def expected_size(name: str) -> int:
+    """Объём модели на диске по каталогу репозитория, байт.
+
+    Спрашивает у Hugging Face один раз и запоминает. 0 — если узнать
+    не удалось (нет сети и т.п.): прогресс тогда показываем без итога.
+    Вызов сетевой, держать надо в фоновом потоке.
+    """
+    if name in _EXPECTED_SIZE:
+        return _EXPECTED_SIZE[name]
+
+    total = 0
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id(name), files_metadata=True)
+        total = sum(file.size or 0 for file in info.siblings)
+    except Exception:  # noqa: BLE001 - сеть не ответила, итог подставим позже
+        return 0
+
+    _EXPECTED_SIZE[name] = total
+    return total
+
+
 @dataclass
 class ModelInfo:
     """Что известно о модели до и после загрузки."""

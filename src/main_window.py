@@ -17,6 +17,8 @@
 
 import os
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -173,6 +175,13 @@ class MainWindow(QMainWindow):
         self._moved_notice_shown = False
         # Пока модель грузится, строка статуса не перебивается
         self._model_loading = False
+        # Состояние таймера прогресса скачивания: метки времени, байты,
+        # скорость, а также момент, когда скачивание сменилось загрузкой
+        self._model_progress_timer: QTimer | None = None
+        self._model_progress_at = 0.0
+        self._model_progress_done = 0
+        self._model_progress_speed = 0.0
+        self._model_loading_since: float | None = None
 
         self._build_ui()
         self._connect()
@@ -237,9 +246,11 @@ class MainWindow(QMainWindow):
     def _build_details_zone(self) -> QWidget:
         """Вторая зона: список записей и текст распознавания.
 
-        Зона свёрнута при запуске и поднимается по кнопке или сама
-        после распознавания. Постоянная часть окна — только то,
-        что нужно для записи: блок, микрофон, кнопки и индикатор.
+        Зона свёрнута при запуске и поднимается по кнопке в правом
+        верхнем углу. Автоматически она не открывается: распознавание
+        может идти в фоне, и окно не должно дёргаться само собой.
+        Постоянная часть окна — только то, что нужно для записи:
+        блок, микрофон, кнопки и индикатор.
         """
         zone = QWidget()
         zone.setProperty("zone", True)
@@ -934,9 +945,9 @@ class MainWindow(QMainWindow):
 
         if self._model_needs_download:
             message = (
-                f"Скачиваю модель «{name}» из интернета и загружаю в память "
-                "— это делается один раз"
+                f"Скачиваю модель «{name}» из интернета — это делается один раз"
             )
+            self._start_download_progress(name)
         elif self._model_moved_from is not None:
             message = (
                 f"Перенёс модель «{name}» из старого кэша и загружаю в память ({size})"
@@ -956,6 +967,102 @@ class MainWindow(QMainWindow):
             on_done=lambda _model: self.signals.model_ready.emit(),
             on_error=lambda err: self.signals.model_failed.emit(str(err)),
         )
+
+    def _start_download_progress(self, name: str) -> None:
+        """Таймер прогресса скачивания: процент, скорость, сколько осталось.
+
+        Общий объём спрашиваем у Hugging Face один раз в фоновом
+        потоке — сетевой запрос не должен задерживать окно.
+        """
+        threading.Thread(
+            target=lambda: model_store.expected_size(name),
+            daemon=True,
+            name="model-size",
+        ).start()
+
+        now = time.monotonic()
+        self._model_progress_at = now
+        self._model_progress_done = 0
+        self._model_progress_speed = 0.0
+        self._model_loading_since = None
+
+        if self._model_progress_timer is None:
+            self._model_progress_timer = QTimer(self)
+            self._model_progress_timer.timeout.connect(self._update_model_progress)
+            self._model_progress_timer.setInterval(500)
+        self._model_progress_timer.start()
+
+    def _update_model_progress(self) -> None:
+        """Один такт таймера: обновляет текст «Скачиваю модель…»."""
+        if not self._model_loading:
+            self._model_progress_timer.stop()
+            return
+
+        name = self.settings.model
+
+        # Скачалось — теперь модель грузится с диска в память,
+        # и это тоже не мгновенно: показываем, сколько уже ждём
+        if model_store.is_cached(name):
+            if self._model_loading_since is None:
+                self._model_loading_since = time.monotonic()
+            seconds = int(time.monotonic() - self._model_loading_since)
+            self._set_status(
+                f"Модель «{name}» скачана, загружаю в память… ({seconds} с)",
+                INFO,
+            )
+            return
+
+        now = time.monotonic()
+        interval = now - self._model_progress_at
+        if interval >= 1.0:
+            done = model_store.downloaded_bytes(name)
+            speed = (done - self._model_progress_done) / interval
+            # Сглаженная скорость: резкие рывки не дёргают текст
+            self._model_progress_speed = (
+                0.7 * self._model_progress_speed + 0.3 * speed
+            )
+            self._model_progress_at = now
+            self._model_progress_done = done
+        else:
+            done = self._model_progress_done
+
+        total = model_store.expected_size(name)
+        if total > 0 and done < total:
+            percent = min(done * 100 // total, 99)
+            remaining = total - done
+            if self._model_progress_speed > 0:
+                minutes = int(remaining / self._model_progress_speed / 60)
+                eta = (
+                    f", осталось ~{minutes} мин"
+                    if minutes >= 1
+                    else ", меньше минуты"
+                )
+            else:
+                eta = ""
+            message = (
+                f"Скачиваю модель «{name}»: {percent}% "
+                f"({self._progress_size(done)} из "
+                f"{model_store.format_size(total)})"
+                f"{self._progress_speed_text()}{eta}"
+            )
+        else:
+            # Объём пока не известен — считаем только уже скачанное
+            message = f"Скачиваю модель «{name}»: уже {self._progress_size(done)}"
+
+        self._set_status(message, INFO)
+
+    def _progress_size(self, size: int) -> str:
+        """Скачанные байты в компактный вид. Ноль не становится «неизвестно»."""
+        if size >= 1024**3:
+            return f"{size / 1024**3:.2f}".replace(".", ",") + " ГБ"
+        return f"{size / 1024**2:.0f} МБ"
+
+    def _progress_speed_text(self) -> str:
+        """Скорость скачивания, если она уже измерилась."""
+        if self._model_progress_speed <= 0:
+            return ""
+        megabytes = self._model_progress_speed / 1024 / 1024
+        return f", {megabytes:.1f}".replace(".", ",") + " МБ/с"
 
     def _format_expected_size(self) -> str:
         """Примерный размер модели на диске с учётом режима кэша.
@@ -1037,6 +1144,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_model_ready(self) -> None:
+        if self._model_progress_timer is not None:
+            self._model_progress_timer.stop()
         name = self.settings.model
         size_text = model_store.format_size(model_store.model_size_on_disk(name))
         self._model_loading = False
@@ -1057,6 +1166,8 @@ class MainWindow(QMainWindow):
         self._update_transcribe_button()
 
     def _on_model_failed(self, error: str) -> None:
+        if self._model_progress_timer is not None:
+            self._model_progress_timer.stop()
         self._model_loading = False
         self._say(f"Не удалось загрузить модель: {error}", ERROR)
         self._update_transcribe_button()
@@ -1161,10 +1272,6 @@ class MainWindow(QMainWindow):
         self.blocks.append(TextBlock(wav=wav, separator=separator))
         self.dirty = False
         self._update_dirty()
-
-        # Зона открывается сама: результат распознавания иначе
-        # негде увидеть, а нажатие кнопки «Распознать» было только что
-        self._show_zone()
 
     def _on_text_changed(self) -> None:
         """Правка пользователя делает окно несохранённым."""
