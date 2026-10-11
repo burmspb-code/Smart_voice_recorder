@@ -11,10 +11,17 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 
-from src.recorder import SAMPLE_RATE, Recorder
+from src.recorder import (
+    SAMPLE_RATE,
+    Recorder,
+    _distinctive,
+    _group_candidates,
+    _match_endpoint,
+)
 
 
 class SpillTest(unittest.TestCase):
@@ -98,3 +105,84 @@ class SpillTest(unittest.TestCase):
         recorder._spilled = 60.0
 
         self.assertAlmostEqual(recorder._duration(), 63.0)
+
+
+class PhysicalMicrophoneTest(unittest.TestCase):
+    """Группировка микрофонов по физическим устройствам из реестра."""
+
+    PHYSICAL: ClassVar[dict[str, str]] = {
+        "{k20}": "Microphone HK 1080P K20Pro",
+        "{amda}": "Microphone Array AMD Audio Device",
+        "{rtk}": "Microphone Realtek High Definition Audio",
+    }
+
+    def test_distinctive_keeps_brand_words_only(self) -> None:
+        self.assertEqual(_distinctive("Realtek High Definition Audio"), {"realtek"})
+        self.assertEqual(_distinctive("Microphone Array AMD Audio Device"), {"amd"})
+
+    def test_match_endpoint_finds_physical_device(self) -> None:
+        self.assertEqual(
+            _match_endpoint("Microphone (HK 1080P K20Pro)", self.PHYSICAL),
+            "{k20}",
+        )
+        self.assertEqual(
+            _match_endpoint("Microphone Array (AMD Audio Device)", self.PHYSICAL),
+            "{amda}",
+        )
+        # Дубли WDM-KS с другими именами тоже опознаются
+        self.assertEqual(
+            _match_endpoint(
+                "Microphone Array 1 (AMDAfdInstall Wave Microphone - 1)",
+                self.PHYSICAL,
+            ),
+            "{amda}",
+        )
+        self.assertEqual(
+            _match_endpoint("Microphone (Realtek HD Audio Mic input)", self.PHYSICAL),
+            "{rtk}",
+        )
+
+    def test_group_keeps_one_entry_per_physical_device(self) -> None:
+        devices = [
+            (1, "Microphone (HK 1080P K20Pro)", 2),  # MME
+            (16, "Microphone (HK 1080P K20Pro)", 0),  # WASAPI, лучший
+            (17, "Microphone Array (AMD Audio Device)", 0),
+            (18, "Microphone (Realtek High Definition Audio)", 0),
+            (22, "Microphone (Realtek HD Audio Mic input)", 3),  # WDM-KS
+            (23, "Microphone Array 1 (AMDAfdInstall Wave Microphone - 1)", 3),
+            (29, "Headset (Redmi Buds 4 Pro)", 3),  # нет в реестре -> отброшен
+        ]
+
+        result = _group_candidates(devices, self.PHYSICAL)
+
+        self.assertEqual(
+            result,
+            [
+                (16, "Microphone (HK 1080P K20Pro)"),
+                (17, "Microphone Array (AMD Audio Device)"),
+                (18, "Microphone (Realtek High Definition Audio)"),
+            ],
+        )
+
+    def test_without_registry_groups_by_exact_name(self) -> None:
+        devices = [
+            (1, "Microphone (HK 1080P K20Pro)", 2),
+            (16, "Microphone (HK 1080P K20Pro)", 0),
+            (17, "Microphone Array (AMD Audio Device)", 0),
+        ]
+
+        result = _group_candidates(devices, None)
+
+        self.assertEqual(
+            result,
+            [(16, "Microphone (HK 1080P K20Pro)"),
+             (17, "Microphone Array (AMD Audio Device)")],
+        )
+
+    def test_unrecognized_names_fall_back_instead_of_empty(self) -> None:
+        # Реестр прочитался, но ни одно имя не совпало — список не пустеет
+        devices = [(5, "Completely Different Name", 0)]
+
+        result = _group_candidates(devices, {"{x}": "Fancy Brand X USB Mic"})
+
+        self.assertEqual(result, [(5, "Completely Different Name")])
