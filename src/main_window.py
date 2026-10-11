@@ -671,6 +671,22 @@ class MainWindow(QMainWindow):
 
         for index, name in devices:
             self.device_box.addItem(name, index)
+            self.device_box.setItemData(
+                self.device_box.count() - 1, name, Qt.ItemDataRole.ToolTipRole
+            )
+
+        # Выпадающий список делаем достаточно широким, чтобы названия
+        # микрофонов не обрезались многоточием
+        self.device_box.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        view = self.device_box.view()
+        try:
+            width_hint = view.sizeHintForColumn(0)
+            scrollbar_w = view.verticalScrollBar().sizeHint().width()
+            view.setMinimumWidth(max(width_hint + scrollbar_w + 16, 360))
+        except Exception:  # noqa: BLE001, S110
+            pass  # не критично: список чуть уже, но рабочий
 
         if chosen is not None:
             position = self.device_box.findData(chosen)
