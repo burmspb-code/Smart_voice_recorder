@@ -40,6 +40,7 @@ from src.core.styles import (
     TEXT,
     apply_property,
 )
+from storage import format_duration
 
 IDLE = "idle"
 RECORDING = "recording"
@@ -186,12 +187,6 @@ class PulseButton(QPushButton):
         )
 
 
-def format_duration(seconds: float) -> str:
-    """Часы и минуты для таймера записи."""
-    total = int(seconds)
-    return f"{total // 60:02d}:{total % 60:02d}"
-
-
 class RecordIndicator(QWidget):
     """Точка, надпись, таймер и уровень звука."""
 
@@ -266,7 +261,7 @@ class RecordIndicator(QWidget):
         self.meter.setValue(max(0, min(100, int(level * 100))))
 
     def set_elapsed(self, seconds: float) -> None:
-        self.timer_label.setText(format_duration(seconds))
+        self.timer_label.setText(format_duration(seconds, pad=True))
 
     def reset(self) -> None:
         """Возвращает вид в исходное состояние."""

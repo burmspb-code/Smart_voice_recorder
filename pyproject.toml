@@ -64,7 +64,3 @@ ignore = [
     "RUF002",
     "RUF003",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-# Проверочные скрипты пишут отчёт в файл и печатают его
-"tests/*" = ["T201"]

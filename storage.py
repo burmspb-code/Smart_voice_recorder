@@ -26,10 +26,17 @@ NO_BLOCK = "без названия"
 INVALID_CHARS = '<>:"/\\|?*'
 
 
-def format_duration(seconds: float) -> str:
-    """Длительность в виде минут и секунд: 0:07, 12:34."""
+def format_duration(seconds: float, pad: bool = False) -> str:
+    """Длительность в виде минут и секунд: 0:07, 12:34.
+
+    pad=True — минуты с ведущим нулём (00:07): так время показывает
+    таймер записи.
+    """
     total = int(seconds)
-    return f"{total // 60}:{total % 60:02d}"
+    minutes = total // 60
+    if pad:
+        return f"{minutes:02d}:{total % 60:02d}"
+    return f"{minutes}:{total % 60:02d}"
 
 
 def read_duration(wav: Path) -> float:
@@ -65,6 +72,7 @@ class Recording:
     has_text: bool
     size_mb: float
     duration: float = 0.0
+    modified: float = 0.0
 
     @property
     def txt(self) -> Path:
@@ -176,10 +184,13 @@ def scan(root: Path) -> list[Recording]:
                 has_text=wav.with_suffix(".txt").exists(),
                 size_mb=stat.st_size / 1024 / 1024,
                 duration=read_duration(wav),
+                modified=stat.st_mtime,
             )
         )
 
-    return sorted(found, key=lambda r: r.wav.stat().st_mtime, reverse=True)
+    # Время берём из уже сделанного stat: повторный вызов без защиты
+    # мог бы упасть, если файл исчез между обходом и сортировкой
+    return sorted(found, key=lambda r: r.modified, reverse=True)
 
 
 def pending(root: Path, block: str | None = None) -> list[Recording]:

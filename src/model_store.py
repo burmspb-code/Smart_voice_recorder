@@ -14,12 +14,296 @@
 Модель не потокобезопасна: одновременно с ней работает только
 один поток распознавания. Поэтому и загрузка, и использование
 проходят через один запор.
+
+Модуль также знает, откуда берётся модель и как она хранится на
+диске: где лежит, скачана ли, сколько занимает места. Эти сведения
+нужны окну, чтобы первый запуск был понятным.
 """
 
+import logging
+import os
+import shutil
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 
-MODEL_CACHE: dict[str, object] = {}
+from .config import models_dir, settings_dir
+
+# --- Тихий режим библиотек Hugging Face ------------------------------------
+# Переменные выставляются до первого импорта huggingface_hub и
+# faster_whisper: библиотеки читают их при импорте. Приложение говорит
+# с пользователем своими сообщениями, а «сырые» строки про отсутствие
+# токена и симлинки в консоли только пугают. Чтобы убрать и их, и
+# подсказки о ходе загрузки, хватает этих четырёх переменных.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
+# Модель хранится не в общем кэше Hugging Face, а в папке приложения.
+# Кэш выглядит одноразовым и его могут удалить; модель должна пережить
+# очистку и переклоне проекта. Переменную нужно задать до импорта
+# huggingface_hub — он читает её при загрузке и дальше не пересматривает.
+os.environ.setdefault("HF_HUB_CACHE", str(models_dir()))
+
+
+def _quiet_library_logs() -> None:
+    """Уводит служебные сообщения библиотек на уровень ERROR и выше."""
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+    logging.getLogger("hf_xet").setLevel(logging.ERROR)
+
+
+def repo_id(name: str) -> str:
+    """Имя модели → идентификатор репозитория на Hugging Face.
+
+    «medium» превращается в «Systran/faster-whisper-medium». Если дали
+    уже готовый идентификатор или путь, возвращается как есть.
+    """
+    from faster_whisper.utils import _MODELS
+
+    return _MODELS.get(name, name)
+
+
+def storage_dir() -> Path:
+    """Папка, где лежит модель. Задаётся через HF_HUB_CACHE на импорте."""
+    from huggingface_hub import constants
+
+    return Path(constants.HF_HUB_CACHE)
+
+
+def repo_cache_dir(name: str) -> Path:
+    """Папка одной модели внутри хранилища."""
+    return storage_dir() / ("models--" + repo_id(name).replace("/", "--"))
+
+
+def _legacy_hub_dir() -> Path:
+    """Стандартный кэш Hugging Face, где модель лежала раньше.
+
+    Он же остаётся местом по умолчанию, если HF_HUB_CACHE не задавать.
+    """
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def migrate_from_legacy(name: str) -> Path | None:
+    """Переносит модель из старого кэша HF в папку приложения.
+
+    Раньше модель скачивалась в общий кэш (~/.cache/huggingface).
+    Теперь она живёт в профиле пользователя, но качать полтора
+    гигабайта заново не нужно: переносим уже готовую.
+
+    Возвращает путь, откуда перенесли, либо None, если переносить
+    нечего — модель уже на месте или её нет в старом кэше.
+    """
+    target = repo_cache_dir(name)
+    if target.exists():
+        return None
+
+    legacy = _legacy_hub_dir() / target.name
+    # Переезд на самого себя и неполный старый кэш пропускаем
+    if legacy == target or not (legacy / "snapshots").is_dir():
+        return None
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy), str(target))
+    except OSError:
+        # Не смогли перенести — скачаем заново, это не повод падать
+        return None
+
+    return legacy
+
+
+def symlinks_supported() -> bool:
+    """Поддерживает ли система симлинки в кэше.
+
+    Без симлинков библиотека копирует файлы, и модель занимает вдвое
+    больше места. На Windows симлинки доступны только в режиме
+    разработчика или от администратора.
+    """
+    try:
+        from huggingface_hub import file_download
+
+        return bool(file_download.are_symlinks_supported())
+    except Exception:  # noqa: BLE001 - не смогли проверить, считаем обычный режим
+        return True
+
+
+def is_cached(name: str) -> bool:
+    """Скачана ли модель в папку приложения и лежит ли там целиком."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        found = try_to_load_from_cache(repo_id(name), "model.bin")
+    except Exception:  # noqa: BLE001 - кэш недоступен, значит ещё не скачано
+        return False
+
+    return isinstance(found, str) and Path(found).is_file()
+
+
+def model_size_on_disk(name: str) -> int:
+    """Сколько байт модель занимает на диске.
+
+    Симлинки не считаются: они указывают на уже посчитанные файлы.
+    А копии в режиме без симлинков считаются — это и есть настоящий
+    расход места, который увидит пользователь.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(repo_cache_dir(name)):
+        for file_name in files:
+            path = Path(root) / file_name
+            try:
+                if path.is_symlink():
+                    continue
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def format_size(size: int) -> str:
+    """Байты в понятный вид: 1,5 ГБ, 460 МБ, 75 МБ."""
+    if size <= 0:
+        return "неизвестно"
+    if size >= 1024**3:
+        return f"{size / 1024**3:.1f}".replace(".", ",") + " ГБ"
+    return f"{size / 1024**2:.0f} МБ"
+
+
+def _blob_bytes(root: Path) -> int:
+    """Настоящие байты модели в кэше, без дублей из snapshots.
+
+    При симлинках snapshots ссылаются на blobs, при копировании
+    содержат вторую полную копию — и в том и в другом случае
+    считать надо только blobs (и временные файлы докачки).
+    """
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+
+        parts = path.relative_to(root).parts
+        if parts and parts[0] in ("snapshots", "trees"):
+            continue
+
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def downloaded_bytes(name: str) -> int:
+    """Сколько байт модели уже легло на диск.
+
+    Считает только настоящие данные: дубли в snapshots (режим
+    копирования) прогресс не удваивают.
+    """
+    return _blob_bytes(repo_cache_dir(name))
+
+
+_EXPECTED_SIZE: dict[str, int] = {}
+
+
+def expected_size(name: str) -> int:
+    """Объём модели на диске по каталогу репозитория, байт.
+
+    Спрашивает у Hugging Face один раз и запоминает. 0 — если узнать
+    не удалось (нет сети и т.п.): прогресс тогда показываем без итога.
+    Вызов сетевой, держать надо в фоновом потоке.
+    """
+    if name in _EXPECTED_SIZE:
+        return _EXPECTED_SIZE[name]
+
+    total = 0
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id(name), files_metadata=True)
+        total = sum(file.size or 0 for file in info.siblings)
+    except Exception:  # noqa: BLE001 - сеть не ответила, итог подставим позже
+        return 0
+
+    _EXPECTED_SIZE[name] = total
+    return total
+
+
+@dataclass
+class ModelInfo:
+    """Что известно о модели до и после загрузки."""
+
+    name: str
+    repo_id: str
+    models_dir: Path
+    cached: bool
+    symlinks: bool
+    footprint: int
+    moved_from: Path | None = None
+
+    @property
+    def duplicates(self) -> bool:
+        """Хранилище держит копии, а не симлинки: места нужно вдвое больше."""
+        return not self.symlinks
+
+
+def describe(name: str) -> ModelInfo:
+    """Собирает сведения о модели для сообщения пользователю.
+
+    Заодно переносит модель из старого кэша Hugging Face, если она
+    там осталась: пользователь не должен качать её заново.
+    """
+    _quiet_library_logs()
+    moved_from = migrate_from_legacy(name)
+    cached = is_cached(name)
+    return ModelInfo(
+        name=name,
+        repo_id=repo_id(name),
+        models_dir=storage_dir(),
+        cached=cached,
+        symlinks=symlinks_supported(),
+        footprint=model_size_on_disk(name) if cached else 0,
+        moved_from=moved_from,
+    )
+
+
+@contextmanager
+def _muted_console():
+    """Прячет служебный вывод библиотек на время загрузки модели.
+
+    Часть сообщений Hugging Face печатает мимо sys.stderr — прямо в
+    файловый дескриптор, поэтому фильтра warnings недостаточно.
+    Перенаправляем сам дескриптор, но пишем в файл рядом с настройками,
+    а не в никуда: если загрузка сорвётся, лог останется для разбора.
+    """
+    log_path = settings_dir() / "model-load.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        saved = os.dup(2)
+    except OSError:
+        # Нет второго дескриптора (запуск без консоли) — глушить нечего
+        yield
+        return
+
+    try:
+        handle = open(log_path, "wb", buffering=0)  # noqa: PTH123, SIM115 - нужен дескриптор
+    except OSError:
+        os.close(saved)
+        yield
+        return
+
+    try:
+        os.dup2(handle.fileno(), 2)
+        yield
+    finally:
+        try:
+            os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+            handle.close()
 
 
 class ModelStore:
@@ -100,11 +384,22 @@ class ModelStore:
         """Отпускает модель. Нужна, если пользователь сменил размер."""
         with self._lock:
             self._model = None
-        MODEL_CACHE.clear()
 
 
 def _create(name: str) -> object:
-    """Создаёт модель. CPU и int8 — единственная связка, проверенная на этой машине."""
+    """Создаёт модель. CPU и int8 — единственная связка, проверенная на этой машине.
+
+    Если модель уже скачана, работаем только с диском: ни сети, ни
+    лишних запросов при обычном запуске.
+    """
+    _quiet_library_logs()
     from faster_whisper import WhisperModel
 
-    return WhisperModel(name, device="cpu", compute_type="int8")
+    local_only = is_cached(name)
+    with _muted_console():
+        return WhisperModel(
+            name,
+            device="cpu",
+            compute_type="int8",
+            local_files_only=local_only,
+        )

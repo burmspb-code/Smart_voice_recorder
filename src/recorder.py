@@ -18,7 +18,13 @@ import threading
 import time
 import wave
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
+
+try:
+    import winreg
+except ImportError:  # не Windows — реестра нет
+    winreg = None
 
 import numpy as np
 import sounddevice as sd
@@ -26,6 +32,14 @@ import sounddevice as sd
 SAMPLE_RATE = 48000
 CHANNELS = 1
 DTYPE = "int16"
+
+# Запись может идти часами, поэтому звук в памяти не копим: как только
+# буфер набрал SPILL_SECONDS звука, поток-сохраняльщик дописывает его
+# в черновой файл рядом с будущей записью. FLUSH_WAKE — как часто он
+# просыпается и смотрит на буфер.
+FLUSH_WAKE = 2.0
+SPILL_SECONDS = 30.0
+SPILL_FRAMES = int(SPILL_SECONDS * SAMPLE_RATE)
 
 # Ниже этого уровня (доля от полной шкалы) подозрительно тихо
 SILENCE_WARNING = 0.01
@@ -53,6 +67,60 @@ API_PREFERENCE = (
     ("wdm", 3),
 )
 
+# Реестр Windows, где Windows сама ведёт список физических микрофонов.
+# PortAudio показывает один микрофон несколько раз — по разу в каждом
+# интерфейсе, а тут каждому устройству соответствует ровно одна запись
+# с состоянием: активно, отключено, не вставлено.
+_MMDEVICES_CAPTURE = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+)
+_DEVICE_STATE_MASK = 0xF
+_DEVICE_STATE_ACTIVE = 1
+_PKEY_FRIENDLY = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+_PKEY_DESCRIPTION = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+
+# Слова, которые не говорят, что это за устройство: «Microphone»,
+# «Audio», «Input» — есть у всех. Для опознания годятся только
+# собственные имена: Realtek, AMD, HK 1080P, Redmi Buds и т.п.
+_STOPWORDS = frozenset(
+    {
+        "audio",
+        "device",
+        "dev",
+        "input",
+        "microphone",
+        "mic",
+        "sound",
+        "high",
+        "definition",
+        "hd",
+        "wave",
+        "array",
+        "internal",
+        "external",
+        "capture",
+        "driver",
+        "card",
+        "usb",
+        "acp",
+        "rear",
+        "front",
+        "line",
+        "surround",
+        "center",
+        "side",
+        "bass",
+        "sub",
+        "device0",
+    }
+)
+
+# Индекс PortAudio -> ключ физического устройства (endpoint из реестра
+# либо имя). Заполняется в candidate_devices() и служит default_device():
+# индекс по умолчанию у Windows может быть дублем того же микрофона
+# в другом интерфейсе.
+_DEVICE_GROUP: dict[int, str] = {}
+
 
 def _api_priority(api_name: str) -> int:
     """Насколько интерфейс предпочтителен для записи голоса."""
@@ -69,34 +137,140 @@ def _is_junk(name: str) -> bool:
     return any(bad in lowered for bad in NOT_A_MICROPHONE)
 
 
+def windows_capture_devices() -> dict[str, str] | None:
+    """Активные физические микрофоны Windows: endpoint-id -> описание.
+
+    Это то, что Windows считает включёнными микрофонами, — по одной
+    записи на устройство, без дублей из разных интерфейсов. None, если
+    реестр недоступен (не Windows или нет прав).
+    """
+    if winreg is None:
+        return None
+
+    devices: dict[str, str] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MMDEVICES_CAPTURE) as root:
+            count, _, _ = winreg.QueryInfoKey(root)
+            for slot in range(count):
+                name = winreg.EnumKey(root, slot)
+                try:
+                    with winreg.OpenKey(root, name) as endpoint:
+                        state = winreg.QueryValueEx(endpoint, "DeviceState")[0]
+                    if state & _DEVICE_STATE_MASK != _DEVICE_STATE_ACTIVE:
+                        continue
+
+                    with winreg.OpenKey(root, name + r"\Properties") as props:
+                        friendly = str(
+                            winreg.QueryValueEx(props, _PKEY_FRIENDLY)[0]
+                        )
+                        description = str(
+                            winreg.QueryValueEx(props, _PKEY_DESCRIPTION)[0]
+                        )
+                except OSError:
+                    continue
+
+                description = f"{friendly} {description}".strip()
+                if _is_junk(description):
+                    continue
+                devices[name] = description
+    except OSError:
+        return None
+
+    return devices
+
+
+def _distinctive(description: str) -> set[str]:
+    """Слова, по которым устройство узнаётся в имени PortAudio."""
+    lowered = "".join(c if c.isalnum() else " " for c in description.lower())
+    return {
+        word
+        for word in lowered.split()
+        if len(word) >= 3 and word not in _STOPWORDS
+    }
+
+
+def _match_endpoint(name: str, devices: dict[str, str]) -> str | None:
+    """К какому физическому микрофону относится имя из PortAudio."""
+    lowered = "".join(c if c.isalnum() else " " for c in name.lower())
+    for endpoint, description in devices.items():
+        words = _distinctive(description)
+        if not words:
+            continue
+        if any(word in lowered for word in words):
+            return endpoint
+    return None
+
+
+def _group_candidates(
+    devices: list[tuple[int, str, int]], physical: dict[str, str] | None
+) -> list[tuple[int, str]]:
+    """По одному варианту на физический микрофон.
+
+    devices — записи PortAudio: (индекс, имя, приоритет интерфейса).
+    Без реестра (physical=None) группирует по точному имени, как
+    раньше: на машинах без Windows другой информации нет.
+    """
+    best: dict[str, tuple[int, int, int, str]] = {}
+    fallback_by_name = physical is None
+    matched = 0
+
+    for index, name, priority in devices:
+        if fallback_by_name:
+            group = name.lower()
+        else:
+            group = _match_endpoint(name, physical)
+            if group is None:
+                continue  # реестр такого микрофона не знает — его сейчас нет
+            matched += 1
+
+        entry = (priority, -len(name), index, name)
+        if group not in best or entry < best[group]:
+            best[group] = entry
+
+    if not fallback_by_name and matched == 0:
+        # Реестр прочитался, но ни одно имя не сопоставилось — не
+        # выбрасываем всё, а возвращаемся к старому правилу
+        best.clear()
+        for index, name, priority in devices:
+            group = name.lower()
+            entry = (priority, -len(name), index, name)
+            if group not in best or entry < best[group]:
+                best[group] = entry
+
+    result = [(index, name) for _p, _len, index, name in best.values()]
+    result.sort(key=lambda item: item[0])
+    return result
+
+
 def candidate_devices() -> list[tuple[int, str]]:
     """Устройства-кандидаты: без дублей и без мусора.
 
     Один и тот же микрофон Windows показывает несколько раз — по разу
-    в каждом интерфейсе. Здесь остаётся лучший вариант каждого имени.
+    в каждом интерфейсе (MME, DirectSound, WASAPI, WDM-KS), и у дублей
+    имена слегка разные. Кандидаты группируются по физическим
+    микрофонам из реестра Windows: от каждого остаётся лучший вариант.
     Звук при этом ещё не проверен, это делает probe_devices().
     """
     apis = {i: a["name"] for i, a in enumerate(sd.query_hostapis())}
-    best: dict[str, tuple[int, int, str]] = {}
 
-    for index, device in enumerate(sd.query_devices()):
-        if device["max_input_channels"] <= 0:
-            continue
-
-        name = device["name"]
-        if _is_junk(name):
-            continue
-
-        key = name.lower()
-        priority = _api_priority(apis.get(device["hostapi"], ""))
-
-        if key not in best or priority < best[key][0]:
-            best[key] = (priority, index, name)
-
-    return [
-        (index, name)
-        for _priority, index, name in sorted(best.values(), key=lambda x: x[1])
+    devices = [
+        (index, device["name"], _api_priority(apis.get(device["hostapi"], "")))
+        for index, device in enumerate(sd.query_devices())
+        if device["max_input_channels"] > 0 and not _is_junk(device["name"])
     ]
+
+    physical = windows_capture_devices() or None
+    result = _group_candidates(devices, physical)
+
+    _DEVICE_GROUP.clear()
+    for index, name in result:
+        if physical is not None:
+            group = _match_endpoint(name, physical) or name.lower()
+        else:
+            group = name.lower()
+        _DEVICE_GROUP[index] = group
+
+    return result
 
 
 def _delivers_audio(device: int, seconds: float = 0.3) -> bool:
@@ -140,7 +314,10 @@ def default_device(devices: list[tuple[int, str]]) -> int | None:
     """Микрофон по умолчанию.
 
     Сначала уважается выбор Windows: если устройство по умолчанию
-    есть в списке рабочих, берётся оно. Иначе — первое рабочее.
+    есть в списке рабочих, берётся оно. Индекс по умолчанию может быть
+    дублем того же микрофона в другом интерфейсе (например, MME) —
+    тогда берём лучший вариант этого же микрофона из списка.
+    Иначе — первое рабочее.
     """
     if not devices:
         return None
@@ -150,9 +327,16 @@ def default_device(devices: list[tuple[int, str]]) -> int | None:
     except Exception:  # noqa: BLE001 - нетPortAudio, значит нет и умолчания
         system_default = None
 
-    for index, _name in devices:
-        if index == system_default:
-            return index
+    if system_default is not None:
+        for index, _name in devices:
+            if index == system_default:
+                return index
+
+        target = _DEVICE_GROUP.get(system_default)
+        if target is not None:
+            for index, _name in devices:
+                if _DEVICE_GROUP.get(index) == target:
+                    return index
 
     return devices[0][0]
 
@@ -181,6 +365,9 @@ class Recorder:
         self._thread: threading.Thread | None = None
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
+        # Черновой файл и то, сколько секунд в него уже сброшено
+        self._spill_path: Path | None = None
+        self._spilled = 0.0
         self._peak = 0.0
         self._level = 0.0
         self._path: Path | None = None
@@ -268,6 +455,8 @@ class Recorder:
 
         self._path = path
         self._frames = []
+        self._spill_path = path.with_suffix(".raw")
+        self._spilled = 0.0
         self._peak = 0.0
         self._level = 0.0
         self._stop.clear()
@@ -342,49 +531,60 @@ class Recorder:
         if not self.is_recording:
             return
 
+        # Порядок важен: сначала гасим колбэк (событие стопа), потом
+        # закрываем звук и ждём, пока поток-сохраняльщик всё выбросит.
         self._cancelled.set()
+        self._stop.set()
         self._paused.clear()
         self._close_stream()
         self._close_segment()
-        self._stop.set()
-
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        self._join_workers()
 
     def stop(self) -> None:
         """Останавливает запись и сохраняет файл."""
         if not self.is_recording:
             return
 
+        # Сначала гасим колбэк — иначе он может успеть добавить пачку
+        # уже после того, как мы решили остановиться (см. _close_stream)
+        self._stop.set()
         self._paused.clear()
-        # Сначала закрываем звук, потом разрешаем сохранять:
-        # так в файл не попадёт половина последней пачки
         self._close_stream()
         self._close_segment()
-        self._stop.set()
+        self._join_workers()
 
+    def _join_workers(self) -> None:
+        """Ждёт, пока фоновый поток закончит сохранять или выбрасывать."""
         if self._thread is not None:
             self._thread.join(timeout=5)
 
     def _wait_worker(self) -> None:
-        """Фоновый поток: ждёт сигнала и сохраняет файл.
+        """Фоновый поток: ждёт стоп и по пути сбрасывает звук на диск.
 
         Звук он не трогает — поток уже закрыт в stop() или cancel().
+        Пока стоп не наступил, просыпается каждые FLUSH_WAKE секунд и
+        переносит накопленное в черновой файл: память держится в рамках
+        SPILL_SECONDS звука при любой длине записи. Потолка по времени
+        нет: как бы долго ни шла запись, стоп будет замечен сразу.
         """
-        self._stop.wait(timeout=300)
+        while not self._stop.wait(FLUSH_WAKE):
+            self._flush_pending()
+
+        # Остаток буфера — тоже в черновик, чтобы сохранять из одного места
+        self._flush_pending(force=True)
 
         if self.on_tick:
             self.on_tick(time.monotonic() - self._started_at)
 
         # Отмена: всё, что накоплено, выбрасывается
         if self._cancelled.is_set():
-            self._frames.clear()
+            self._discard()
             if self.on_cancelled:
                 self.on_cancelled()
             return
 
         # Если остановили, не начав, или звука не было — файла не будет
-        if not self._frames:
+        if not self._frames and self._spilled == 0.0:
             if self.on_empty:
                 self.on_empty()
             return
@@ -403,20 +603,73 @@ class Recorder:
         if self.on_finished:
             self.on_finished(path, self._duration(), self._peak)
 
+    def _flush_pending(self, *, force: bool = False) -> None:
+        """Переносит накопленный звук в черновой файл, если это нужно.
+
+        force забирает всё, что есть в буфере: так в конце вся запись
+        оказывается в одном месте — в черновике, и сохранять можно
+        оттуда напрямую.
+        """
+        if not force:
+            buffered = sum(len(chunk) for chunk in self._frames)
+            if buffered < SPILL_FRAMES:
+                return
+
+        pending, self._frames = self._frames, []
+        if not pending:
+            return
+
+        spill = self._spill_path
+        if spill is None:
+            return
+
+        spill.parent.mkdir(parents=True, exist_ok=True)
+        with spill.open("ab") as raw:
+            raw.write(np.concatenate(pending).tobytes())
+
+        self._spilled += sum(len(chunk) for chunk in pending) / SAMPLE_RATE
+
+    def _discard(self) -> None:
+        """Выбрасывает накопленное: память и черновой файл."""
+        self._frames = []
+        self._spilled = 0.0
+
+        spill = self._spill_path
+        if spill is not None:
+            with suppress(OSError):
+                spill.unlink(missing_ok=True)
+
     def _write(self, path: Path) -> None:
-        audio = np.concatenate(self._frames)
+        """Собирает wav из черновика.
+
+        Звук сбрасывался на диск по частям ещё во время записи
+        (_flush_pending), поэтому итоговый файл переписывается из
+        черновика байт в байт — копить всё в памяти не нужно.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        spill = self._spill_path
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(CHANNELS)
             wav.setsampwidth(2)
             wav.setframerate(SAMPLE_RATE)
-            wav.writeframes(audio.tobytes())
+            if spill is not None and spill.is_file():
+                with spill.open("rb") as raw:
+                    while True:
+                        block = raw.read(1024 * 1024)
+                        if not block:
+                            break
+                        wav.writeframes(block)
+
+        # Черновик сослужил службу — он больше не нужен
+        if spill is not None:
+            with suppress(OSError):
+                spill.unlink(missing_ok=True)
 
     def _duration(self) -> float:
-        if not self._frames:
-            return 0.0
-        return sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        """Сколько секунд записано, включая сброшенное на диск."""
+        buffered = sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        return self._spilled + buffered
 
     def is_too_quiet(self) -> bool:
         """Заметно тихо — похоже, микрофон не тот или выключен."""
