@@ -78,3 +78,49 @@ class TranscribeFileTest(unittest.TestCase):
 
         self.assertEqual((lines, text, finished), (0, "", False))
         self.assertFalse(wav.with_suffix(".txt").exists())
+
+
+class VadBrokenStub(WhisperStub):
+    """Модель, у которой фильтр тишины не работает.
+
+    Так выглядит запуск на чужой машине или в собранном .exe, где
+    файл silero_vad_v6.onnx не оказался рядом с faster-whisper.
+    """
+
+    def __init__(self, segments: list[Segment]) -> None:
+        super().__init__(segments)
+        self.attempts: list[bool] = []
+
+    def transcribe(self, path, **kwargs):
+        vad = kwargs.get("vad_filter", False)
+        self.attempts.append(vad)
+        if vad:
+            raise RuntimeError("NoSuchFile: silero_vad_v6.onnx")
+        return super().transcribe(path, **kwargs)
+
+
+class VadFallbackTest(unittest.TestCase):
+    """Без модели фильтра тишины распознавание всё равно идёт."""
+
+    @staticmethod
+    def _wav_file() -> Path:
+        return Path(tempfile.mkdtemp()) / "запись.wav"
+
+    def test_retries_without_vad_filter(self) -> None:
+        wav = self._wav_file()
+        model = VadBrokenStub([Segment(0.0, 1.0, "привет")])
+
+        lines, text, finished = transcribe_file(model, wav)
+
+        self.assertTrue(finished)
+        self.assertEqual(lines, 1)
+        self.assertEqual(text, "[00:00] привет")
+        self.assertEqual(model.attempts, [True, False])
+
+    def test_other_error_is_not_hidden(self) -> None:
+        class BrokenStub(WhisperStub):
+            def transcribe(self, path, **kwargs):
+                raise OSError("файл повреждён")
+
+        with self.assertRaises(OSError):
+            transcribe_file(BrokenStub([]), self._wav_file())

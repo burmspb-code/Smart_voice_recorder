@@ -129,6 +129,8 @@ class Settings:
         self.model: str = DEFAULT_MODEL
         self.microphone: int | None = None  # None — выбрать автоматически
         self.last_block: str = ""
+        self.auto_transcribe: bool = False
+        self.auto_copy: bool = True
         self.load()
 
     def load(self) -> None:
@@ -154,6 +156,9 @@ class Settings:
 
         self.last_block = str(data.get("last_block") or "")
 
+        self.auto_transcribe = bool(data.get("auto_transcribe", False))
+        self.auto_copy = bool(data.get("auto_copy", True))
+
     def save(self) -> None:
         """Пишет настройки в файл. Папка создаётся при первом сохранении."""
         path = settings_file()
@@ -164,6 +169,8 @@ class Settings:
             "model": self.model,
             "microphone": self.microphone,
             "last_block": self.last_block,
+            "auto_transcribe": self.auto_transcribe,
+            "auto_copy": self.auto_copy,
         }
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
