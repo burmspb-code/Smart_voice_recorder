@@ -14,6 +14,7 @@
 или все нераспознанные.
 """
 
+import logging
 import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -63,22 +64,51 @@ def transcribe_file(
     запись просто остаётся без текста, и её можно распознать
     заново.
     """
-    raw_segments, _info = model.transcribe(
-        str(wav),
-        language=LANGUAGE,
-        vad_filter=True,  # вырезает тишину: быстрее и чище результат
-        beam_size=5,
-    )
-
-    collected = []
-    for segment in raw_segments:
-        if should_cancel and should_cancel():
-            return 0, "", False
-        collected.append((segment.start, segment.end, segment.text))
+    collected = _read_segments(model, wav, vad_filter=True, should_cancel=should_cancel)
+    if collected is None:
+        return 0, "", False
 
     text = format_text(collected)
     wav.with_suffix(".txt").write_text(text, encoding="utf-8")
     return len(collected), text, True
+
+
+def _read_segments(
+    model,
+    wav: Path,
+    vad_filter: bool,
+    should_cancel: Callable[[], bool] | None,
+) -> list[tuple[float, float, str]] | None:
+    """Читает куски речи. None — пользователь нажал отмену.
+
+    Сначала пробуем с фильтром тишины: он вырезает паузы, и разбор
+    заметно быстрее и чище. Но модель фильтра — это отдельный файл
+    рядом с faster-whisper, и в собранном .exe он может не оказаться
+    на месте (и на чужой машине тоже). Тогда пробуем без него:
+    медленнее и шумнее на тихих записях, но работает всегда.
+    """
+    try:
+        raw_segments, _info = model.transcribe(
+            str(wav),
+            language=LANGUAGE,
+            vad_filter=vad_filter,
+            beam_size=5,
+        )
+
+        collected = []
+        for segment in raw_segments:
+            if should_cancel and should_cancel():
+                return None
+            collected.append((segment.start, segment.end, segment.text))
+    except Exception:
+        if vad_filter:
+            logging.getLogger(__name__).warning(
+                "Фильтр тишины не сработал, пробуем без него: %s", wav.name
+            )
+            return _read_segments(model, wav, vad_filter=False, should_cancel=should_cancel)
+        raise
+
+    return collected
 
 
 class Transcriber:

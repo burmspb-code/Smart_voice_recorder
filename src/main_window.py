@@ -33,6 +33,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QFileDialog,
@@ -167,6 +168,10 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self._appending = False
 
+        # Сколько символов ушло в буфер по ходу текущего распознавания:
+        # показываем это в итоговой строке состояния
+        self._copied_chars = 0
+
         # Сведения о модели: нужны, чтобы первый запуск был понятным
         self._model_info: model_store.ModelInfo | None = None
         self._model_needs_download = False
@@ -206,6 +211,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_top_row())
+        layout.addWidget(self._build_auto_row())
         layout.addLayout(self._build_control_row())
         layout.addWidget(self._build_level())
         layout.addWidget(self._build_details_zone())
@@ -326,9 +332,42 @@ class MainWindow(QMainWindow):
         self.model_box = QComboBox()
         for name, label in AVAILABLE_MODELS.items():
             self.model_box.addItem(label, name)
+        self.model_box.setToolTip(
+            "Модель распознавания.\n"
+            "Смена подхватывается при следующем запуске."
+        )
         row.addWidget(self.model_box, 2)
 
         return row
+
+    def _build_auto_row(self) -> QWidget:
+        """Переключатели автоматической расшифровки.
+
+        С ними обычный сценарий короткий: записал, нажал ■, текст
+        сам расшифровался и лёг в буфер обмена — вставлять можно
+        сразу, не открывая нижнюю зону.
+        """
+        holder = QWidget()
+        box = QHBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
+        self.auto_transcribe_box = QCheckBox("Распознавать после остановки")
+        self.auto_transcribe_box.setChecked(self.settings.auto_transcribe)
+        self.auto_transcribe_box.setToolTip(
+            "Автораспознавание после нажатия клавиши Stop"
+        )
+        self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
+        box.addWidget(self.auto_transcribe_box)
+
+        self.auto_copy_box = QCheckBox("Копировать в буфер")
+        self.auto_copy_box.setChecked(self.settings.auto_copy)
+        self.auto_copy_box.setToolTip("Скопировать текст последней записи")
+        self.auto_copy_box.toggled.connect(self._on_auto_copy)
+        box.addWidget(self.auto_copy_box)
+
+        box.addStretch(1)
+        return holder
 
     @staticmethod
     def _icon_label(name: str, tip: str) -> QLabel:
@@ -416,7 +455,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setIcon(icon("cancel"))
         self.cancel_button.setIconSize(QSize(22, 22))
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setToolTip("Записать заново, файл не сохранится")
+        self.cancel_button.setToolTip("Отменить последнюю запись")
         row.addWidget(self.cancel_button)
 
         row.addStretch(1)
@@ -817,11 +856,18 @@ class MainWindow(QMainWindow):
         Пока идёт распознавание, кнопка остаётся нажимаемой: ею
         прерывают работу. Выключать её нельзя — тогда исчез бы
         и перелив, и способ остановить распознавание.
+
+        Заодно обновляет доступность записи: одновременно писать
+        и распознавать нельзя, иначе пришлось бы молча ронять
+        распознавание по второму нажатию.
         """
         if self.transcriber.is_busy:
             self.transcribe_button.setEnabled(True)
             self._set_transcribe_caption("Остановить")
+            self._lock_record_during_transcribe(True)
             return
+
+        self._lock_record_during_transcribe(False)
 
         recorder = self.recorder
         recording = recorder.is_recording if recorder is not None else False
@@ -831,6 +877,27 @@ class MainWindow(QMainWindow):
 
         self.transcribe_button.setEnabled(has_pending and not recording)
         self._set_transcribe_caption("Распознать")
+
+    def _lock_record_during_transcribe(self, busy: bool) -> None:
+        """Гасит кнопку записи, пока идёт распознавание.
+
+        Модель не потокобезопасна и работает в своём потоке: вторая
+        запись заняла бы микрофон и CPU, а распознавание — тем более.
+        Раньше нажатие просто отменяло распознавание молча, и
+        половина файлов оставалась без текста.
+        """
+        if busy:
+            self.record_button.setEnabled(False)
+            self.record_button.setToolTip(
+                "Дождитесь окончания распознавания — потом можно будет записать снова"
+            )
+            return
+
+        recorder = self.recorder
+        if recorder is not None and recorder.is_recording:
+            return  # идёт запись — состояние кнопки ведёт _update_record_ui
+
+        self.record_button.setEnabled(True)
 
     # ----------------------------------------------------------------- запись
 
@@ -852,6 +919,15 @@ class MainWindow(QMainWindow):
 
     def _toggle_record(self) -> None:
         """Одна клавиша на три состояния: начать, пауза, продолжить."""
+        # Кнопку мы уже гасим, но сюда попадают и горячие клавиши,
+        # и автозапуск: микрофон должен быть один
+        if self.transcriber.is_busy:
+            self._say(
+                "Идёт распознавание — запись начнётся сразу после него",
+                WARNING,
+            )
+            return
+
         recorder = self._ensure_recorder()
 
         if recorder.is_recording:
@@ -930,6 +1006,19 @@ class MainWindow(QMainWindow):
         if peak < 0.01:
             message += "  — звук почти не записан"
         self._say(message, SUCCESS)
+
+        if self.auto_transcribe_box.isChecked():
+            self._transcribe()
+
+    # ------------------------------------------------- автоматическая расшифровка
+
+    def _on_auto_transcribe(self, checked: bool) -> None:
+        self.settings.auto_transcribe = checked
+        self.settings.save()
+
+    def _on_auto_copy(self, checked: bool) -> None:
+        self.settings.auto_copy = checked
+        self.settings.save()
 
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)
@@ -1266,7 +1355,10 @@ class MainWindow(QMainWindow):
         else:
             remaining = len(storage.pending(self.recordings))
             suffix = f", осталось без текста: {remaining}" if remaining else ""
+            if self._copied_chars:
+                suffix += f", скопировано в буфер: {self._copied_chars} символов"
             self._say(f"Распознано файлов: {done}{suffix}", SUCCESS)
+            self._copied_chars = 0
 
     # ------------------------------------------------------------------ текст
 
@@ -1288,6 +1380,16 @@ class MainWindow(QMainWindow):
         self.blocks.append(TextBlock(wav=wav, separator=separator))
         self.dirty = False
         self._update_dirty()
+
+        # В буфер идёт только что распознанный кусок, а не всё окно:
+        # после ■ в буфер должен попасть ровно то, что он сейчас
+        # записал, иначе вставить «куда угодно» неудобно — в буфер
+        # уехала бы вся история разговора вместе с разделителями.
+        # Пустой текст тоже не кладём: стёртое содержимое буфера
+        # было бы не вернуть.
+        if self.auto_copy_box.isChecked() and text.strip():
+            QApplication.clipboard().setText(text.strip())
+            self._copied_chars = len(text.strip())
 
     def _on_text_changed(self) -> None:
         """Правка пользователя делает окно несохранённым."""
