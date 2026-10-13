@@ -28,11 +28,16 @@ LANGUAGE = "ru"
 PARAGRAPH_GAP = 2.0
 
 
-def format_text(segments: list[tuple[float, float, str]]) -> str:
+def format_text(
+    segments: list[tuple[float, float, str]],
+    timecodes: bool = True,
+) -> str:
     """Собирает текст с абзацами.
 
     Новый абзац начинается там, где человек замолчал дольше двух секунд.
-    Метки времени остаются в начале каждой строки.
+
+    Метки времени можно не ставить: готовый текст, который уходит
+    в буфер обмена или чужой программе, от них только мешает.
     """
     parts: list[str] = []
     previous_end: float | None = None
@@ -41,9 +46,13 @@ def format_text(segments: list[tuple[float, float, str]]) -> str:
         if previous_end is not None and start - previous_end > PARAGRAPH_GAP:
             parts.append("")  # пустая строка = граница абзаца
 
-        minutes = int(start // 60)
-        seconds = int(start % 60)
-        parts.append(f"[{minutes:02d}:{seconds:02d}] {text.strip()}")
+        stamp = ""
+        if timecodes:
+            minutes = int(start // 60)
+            seconds = int(start % 60)
+            stamp = f"[{minutes:02d}:{seconds:02d}] "
+
+        parts.append(f"{stamp}{text.strip()}")
         previous_end = end
 
     return "\n".join(parts)
@@ -53,6 +62,7 @@ def transcribe_file(
     model,
     wav: Path,
     should_cancel: Callable[[], bool] | None = None,
+    timecodes: bool = True,
 ) -> tuple[int, str, bool]:
     """Расшифровывает один файл.
 
@@ -68,7 +78,7 @@ def transcribe_file(
     if collected is None:
         return 0, "", False
 
-    text = format_text(collected)
+    text = format_text(collected, timecodes=timecodes)
     wav.with_suffix(".txt").write_text(text, encoding="utf-8")
     return len(collected), text, True
 
@@ -135,6 +145,7 @@ class Transcriber:
         on_file_done: Callable[[Path, int, str], None] | None = None,
         on_all_done: Callable[[int, int, bool], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
+        timecodes: bool = True,
     ) -> bool:
         """Ставит файлы в очередь. False — уже идёт распознавание."""
         if self.is_busy:
@@ -154,6 +165,7 @@ class Transcriber:
                 on_file_done,
                 on_all_done,
                 on_error,
+                timecodes,
             ),
             daemon=True,
             name="transcriber",
@@ -177,6 +189,7 @@ class Transcriber:
         on_file_done,
         on_all_done,
         on_error,
+        timecodes: bool,
     ) -> None:
         done = 0
         total = len(queue)
@@ -197,7 +210,10 @@ class Transcriber:
 
             try:
                 segments, text, finished = transcribe_file(
-                    model, wav, should_cancel=self._cancel.is_set
+                    model,
+                    wav,
+                    should_cancel=self._cancel.is_set,
+                    timecodes=timecodes,
                 )
             except Exception as error:  # noqa: BLE001 - причина уходит в строку статуса
                 if on_error:

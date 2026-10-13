@@ -33,8 +33,10 @@ class SettingsTest(unittest.TestCase):
         settings = config.Settings()
         self.assertIsNone(settings.microphone)
         self.assertEqual(settings.last_block, "")
-        self.assertFalse(settings.auto_transcribe)
+        # Все три переключателя при первом запуске включены
+        self.assertTrue(settings.auto_transcribe)
         self.assertTrue(settings.auto_copy)
+        self.assertTrue(settings.timecodes)
 
     def test_round_trip(self) -> None:
         settings = config.Settings()
