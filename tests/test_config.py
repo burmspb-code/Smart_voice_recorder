@@ -37,6 +37,9 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(settings.auto_transcribe)
         self.assertTrue(settings.auto_copy)
         self.assertTrue(settings.timecodes)
+        # Остановка по тишине тоже включена, срок — пять секунд
+        self.assertTrue(settings.auto_stop)
+        self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
 
     def test_round_trip(self) -> None:
         settings = config.Settings()
@@ -46,6 +49,8 @@ class SettingsTest(unittest.TestCase):
         settings.last_block = "идея"
         settings.auto_transcribe = True
         settings.auto_copy = False
+        settings.auto_stop = False
+        settings.auto_stop_seconds = 10
         settings.save()
 
         again = config.Settings()
@@ -56,6 +61,39 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(again.last_block, "идея")
         self.assertTrue(again.auto_transcribe)
         self.assertFalse(again.auto_copy)
+        self.assertFalse(again.auto_stop)
+        self.assertEqual(again.auto_stop_seconds, 10)
+
+    def test_nonsense_timeout_keeps_default(self) -> None:
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"auto_stop_seconds": "сколько хочешь"}', encoding="utf-8"
+        )
+
+        settings = config.Settings()
+
+        self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
+
+    def test_boolean_timeout_keeps_default(self) -> None:
+        # True — это тоже int в Python, но сроком в секундах он не бывает
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"auto_stop_seconds": true}', encoding="utf-8")
+
+        settings = config.Settings()
+
+        self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
+
+    def test_custom_timeout_survives(self) -> None:
+        # Срок можно задать руками, даже если его нет в списке выбора
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"auto_stop_seconds": 7}', encoding="utf-8")
+
+        settings = config.Settings()
+
+        self.assertEqual(settings.auto_stop_seconds, 7)
 
     def test_broken_file_keeps_defaults(self) -> None:
         path = config.settings_file()

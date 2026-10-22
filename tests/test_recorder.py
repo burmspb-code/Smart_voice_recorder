@@ -60,6 +60,9 @@ class SpillTest(unittest.TestCase):
         recorder._frames = [np.zeros(SAMPLE_RATE * 5, dtype=np.int16)]
         recorder._flush_pending(force=True)
         recorder._frames = [np.ones(SAMPLE_RATE * 3, dtype=np.int16)]
+        # Речь заняла всю запись — тишину по краям отрезать нечего
+        recorder._voice_start = 0
+        recorder._voice_end = SAMPLE_RATE * 8
         recorder._stop.set()
 
         recorder._wait_worker()
@@ -103,8 +106,26 @@ class SpillTest(unittest.TestCase):
         recorder = Recorder()
         recorder._frames = [np.zeros(SAMPLE_RATE * 3, dtype=np.int16)]
         recorder._spilled = 60.0
+        recorder._voice_start = 0
+        recorder._voice_end = SAMPLE_RATE * 63
 
         self.assertAlmostEqual(recorder._duration(), 63.0)
+
+    def test_duration_cuts_off_silent_tail(self) -> None:
+        recorder = Recorder()
+        recorder._frames = [np.zeros(SAMPLE_RATE * 3, dtype=np.int16)]
+        recorder._spilled = 60.0
+        # Речь закончилась на десятой секунде, дальше была тишина
+        recorder._voice_start = 0
+        recorder._voice_end = SAMPLE_RATE * 10
+
+        self.assertAlmostEqual(recorder._duration(), 10.0)
+
+    def test_duration_without_voice_is_zero(self) -> None:
+        recorder = Recorder()
+        recorder._frames = [np.zeros(SAMPLE_RATE * 3, dtype=np.int16)]
+
+        self.assertEqual(recorder._duration(), 0.0)
 
 
 class PhysicalMicrophoneTest(unittest.TestCase):

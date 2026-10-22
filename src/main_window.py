@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (
 
 import storage
 from src import config, model_store
-from src.config import AVAILABLE_MODELS, Settings
+from src.config import AUTO_STOP_CHOICES, AVAILABLE_MODELS, Settings
 from src.core.icons import app_icon, icon
 from src.core.styles import (
     LIVE,
@@ -86,6 +86,10 @@ from src.widgets import (
 # Обновление индикатора и таймера. Быстрее 30 раз в секунду
 # незаметно глазом, но окно перестаёт отвечать.
 UI_TICK_MS = 33
+
+# За сколько секунд до конца срока предупредить, что запись сейчас
+# остановится. Без предупреждения автостоп выглядит как поломка.
+AUTO_STOP_WARN = 2.0
 
 
 class Signals(QObject):
@@ -201,6 +205,12 @@ class MainWindow(QMainWindow):
         self._model_progress_done = 0
         self._model_progress_speed = 0.0
         self._model_loading_since: float | None = None
+
+        # Остановка записи по тишине: предупреждение показано,
+        # а сама остановка уже случилась — оба флага живут между
+        # тиками, поэтому их надо помнить
+        self._auto_stop_warned = False
+        self._auto_stopped = False
 
         self._build_ui()
         self._connect()
@@ -386,11 +396,44 @@ class MainWindow(QMainWindow):
         self.timecodes_box.setToolTip("Добавлять в текст распознавания")
         box.addWidget(self.timecodes_box)
 
+        # Остановка по тишине: микрофон замолчал — значит, человек
+        # закончил и забыл нажать ■. Число секунд рядом, чтобы срок
+        # можно было менять, не правя код.
+        self.auto_stop_box = QCheckBox("Стоп по тишине")
+        self.auto_stop_box.setChecked(self.settings.auto_stop)
+        self.auto_stop_box.setToolTip(
+            "Останавливать запись, если микрофон замолчал"
+        )
+        box.addWidget(self.auto_stop_box)
+
+        self.auto_stop_seconds_box = QComboBox()
+        # Сохранённый срок попадает в список, даже если его там не было:
+        # файл настроек можно править руками, и тогда значение не
+        # должно молча превращаться в другое
+        choices = list(AUTO_STOP_CHOICES)
+        saved = self.settings.auto_stop_seconds
+        if saved not in choices:
+            choices.append(saved)
+        for seconds in choices:
+            self.auto_stop_seconds_box.addItem(f"{seconds} с", seconds)
+        chosen = self.auto_stop_seconds_box.findData(saved)
+        if chosen >= 0:
+            self.auto_stop_seconds_box.setCurrentIndex(chosen)
+        self.auto_stop_seconds_box.setToolTip(
+            "Сколько секунд тишины считать концом записи"
+        )
+        self.auto_stop_seconds_box.setEnabled(self.settings.auto_stop)
+        box.addWidget(self.auto_stop_seconds_box)
+
         # Слоты подключаем последними: до этого момента расстановка
         # галочек ещё не должна была ничего записывать в настройки
         self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
         self.auto_copy_box.toggled.connect(self._on_auto_copy)
         self.timecodes_box.toggled.connect(self._on_timecodes)
+        self.auto_stop_box.toggled.connect(self._on_auto_stop)
+        self.auto_stop_seconds_box.currentIndexChanged.connect(
+            self._on_auto_stop_seconds
+        )
 
         box.addStretch(1)
         return holder
@@ -972,6 +1015,8 @@ class MainWindow(QMainWindow):
             self._say(f"Не удалось начать запись: {error}", ERROR)
             return
 
+        self._auto_stop_warned = False
+        self._auto_stopped = False
         self._set_recording_ui(True)
         self._say(f"Идёт запись → {target.name}")
 
@@ -1029,7 +1074,10 @@ class MainWindow(QMainWindow):
         self._refresh_list()
 
         message = f"Готово: {Path(path).name}  ({format_duration(duration)})"
-        if peak < 0.01:
+        if self._auto_stopped:
+            # Пользователь ■ не нажимал — надо сказать, что произошло
+            message += "  — остановлено по тишине"
+        elif peak < 0.01:
             message += "  — звук почти не записан"
         self._say(message, SUCCESS)
 
@@ -1050,9 +1098,21 @@ class MainWindow(QMainWindow):
         self.settings.timecodes = checked
         self.settings.save()
 
+    def _on_auto_stop(self, checked: bool) -> None:
+        self.settings.auto_stop = checked
+        self.settings.save()
+        # Без галочки выбор срока бесполезен — прячем его
+        self.auto_stop_seconds_box.setEnabled(checked)
+
+    def _on_auto_stop_seconds(self) -> None:
+        seconds = self.auto_stop_seconds_box.currentData()
+        if isinstance(seconds, int):
+            self.settings.auto_stop_seconds = seconds
+            self.settings.save()
+
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)
-        self._say("Звука не было, файл не создан", WARNING)
+        self._say("Отсутствуют входные данные, запись отменена", WARNING)
 
     def _on_error(self, message: str) -> None:
         """Ошибка из рабочего потока: показываем текстом в строке состояния."""
@@ -1738,6 +1798,39 @@ class MainWindow(QMainWindow):
 
         self.indicator.set_elapsed(recorder.elapsed)
         self.indicator.set_level(recorder.level)
+
+        self._check_auto_stop(recorder)
+
+    def _check_auto_stop(self, recorder: Recorder) -> None:
+        """Останавливает запись, если микрофон молчит дольше срока.
+
+        Тишину считает сам рекордер, а решение принимается здесь: поток
+        звука нельзя закрывать из фонового потока, только из того, где
+        его открывали. Тикер окна как раз работает в главном потоке.
+        """
+        if not self.auto_stop_box.isChecked():
+            return
+
+        # Пауза — это решение человека, а не молчание микрофона
+        if recorder.is_paused:
+            return
+
+        limit = float(self.settings.auto_stop_seconds)
+        silence = recorder.silence_seconds
+
+        if silence < limit - min(AUTO_STOP_WARN, limit / 2):
+            self._auto_stop_warned = False
+            return
+
+        if not self._auto_stop_warned:
+            self._auto_stop_warned = True
+            left = max(1, round(limit - silence))
+            self._say(f"Тишина — остановлю запись через {left} с", WARNING)
+
+        if silence >= limit:
+            self._auto_stopped = True
+            recorder.stop()
+            self._set_recording_ui(False)
 
     def showEvent(self, event) -> None:
         """При первом показе окно ужимается под содержимое.
