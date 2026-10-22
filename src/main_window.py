@@ -132,8 +132,11 @@ class Signals(QObject):
 
 # Столбцы таблицы записей
 # Виды сообщений внизу окна. Цвет выбирается по смыслу:
-# успех, предупреждение и ошибка не должны выглядеть одинаково
+# успех, предупреждение и ошибка не должны выглядеть одинаково.
+# У BUSY свой цвет: пока идёт запись или распознавание, строка должна
+# притягивать взгляд — иначе кажется, что приложение просто зависло
 INFO = "info"
+BUSY = "busy"
 SUCCESS = "success"
 WARNING = "warning"
 ERROR = "error"
@@ -1037,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._auto_stop_warned = False
         self._auto_stopped = False
         self._set_recording_ui(True)
-        self._say(f"Идёт запись → {target.name}")
+        self._say(f"Идёт запись → {target.name}", BUSY)
 
     def _stop_record(self) -> None:
         """Останавливает запись и сразу сохраняет файл.
@@ -1051,7 +1054,7 @@ class MainWindow(QMainWindow):
 
         recorder.stop()
         self._set_recording_ui(False)
-        self._say("Сохраняю запись…")
+        self._say("Сохраняю запись…", BUSY)
 
     def _cancel_record(self) -> None:
         self._ensure_recorder().cancel()
@@ -1082,7 +1085,7 @@ class MainWindow(QMainWindow):
             self.record_button.setIcon(icon("play", BUTTON_ICON))
             self.record_button.setToolTip("Продолжить запись")
             self.indicator.set_state(PAUSED)
-            self._say("Пауза — нажмите ту же клавишу, чтобы продолжить")
+            self._say("Пауза — нажмите ту же клавишу, чтобы продолжить", BUSY)
         else:
             self.record_button.setIcon(icon("pause", BUTTON_ICON))
             self.record_button.setToolTip("Пауза")
@@ -1186,7 +1189,7 @@ class MainWindow(QMainWindow):
         # Пока модель не готова, это сообщение главное: обычные строки
         # статуса его не перебивают (см. _say).
         self._model_loading = True
-        self._set_status(message, INFO)
+        self._set_status(message, BUSY)
 
         self.model_store.load_async(
             name,
@@ -1234,7 +1237,7 @@ class MainWindow(QMainWindow):
             seconds = int(time.monotonic() - self._model_loading_since)
             self._set_status(
                 f"Модель «{name}» скачана, загружаю в память… ({seconds} с)",
-                INFO,
+                BUSY,
             )
             return
 
@@ -1275,7 +1278,7 @@ class MainWindow(QMainWindow):
             # Объём пока не известен — считаем только уже скачанное
             message = f"Скачиваю модель «{name}»: уже {self._progress_size(done)}"
 
-        self._set_status(message, INFO)
+        self._set_status(message, BUSY)
 
     def _progress_size(self, size: int) -> str:
         """Скачанные байты в компактный вид. Ноль не становится «неизвестно»."""
@@ -1407,7 +1410,7 @@ class MainWindow(QMainWindow):
         """
         if self.transcriber.is_busy:
             self.transcriber.cancel()
-            self._say("Останавливаю распознавание…", WARNING)
+            self._say("Останавливаю распознавание…", BUSY)
             return
 
         waiting = storage.pending(self.recordings, block=self._current_block())
@@ -1416,7 +1419,7 @@ class MainWindow(QMainWindow):
             return
 
         target = waiting[0]
-        self._say(f"Распознаю {target.name}")
+        self._say(f"Распознаю {target.name}", BUSY)
         self._pulse_start("Распознаю…")
 
         started = self.transcriber.start(
@@ -1454,7 +1457,7 @@ class MainWindow(QMainWindow):
 
     def _on_file_started(self, wav: str) -> None:
         self._pulse_start(f"Распознаю {Path(wav).name}…")
-        self._say(f"Распознаю {Path(wav).name}, это займёт время")
+        self._say(f"Распознаю {Path(wav).name}, это займёт время", BUSY)
 
     def _on_file_done(self, wav: str, lines: int, text: str) -> None:
         self._append_text(Path(wav), text)
@@ -1484,6 +1487,18 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ текст
 
+    def _scroll_to_end(self) -> None:
+        """Прокручивает текст к последнему куску.
+
+        Новый кусок встаёт ниже видимой части, и без прокрутки
+        распознанное остаётся за нижним краем: пользователь видел бы
+        его, только потянув ползунок сам. Курсор при этом не трогаем —
+        иначе правка посреди текста при следующей записи уехала бы
+        в самый конец.
+        """
+        bar = self.text_edit.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def _insert_separator(self, title: str, text: str) -> None:
         """Вставляет кусок текста вместе с разделителем перед ним.
 
@@ -1496,6 +1511,11 @@ class MainWindow(QMainWindow):
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if self.text_edit.toPlainText():
+            # Пустая строка перед полосой: без неё куски липнут друг
+            # к другу. QPlainTextEdit не умеет отступы абзацев, поэтому
+            # это отдельная пустая строка — в тексте она остаётся, и по
+            # ней видно, где кончилась одна запись и началась другая
+            cursor.insertBlock()
             cursor.insertBlock()
 
         mark = QTextBlockFormat()
@@ -1546,6 +1566,10 @@ class MainWindow(QMainWindow):
         # таймкоды, и пустой полосой без единого символа, если нет
         title = f"── {stamp} · {title} ──" if self.timecodes_box.isChecked() else ""
         self._insert_separator(title, text)
+
+        # Свежий кусок должен быть на виду: он встаёт ниже видимой
+        # части, и без прокрутки его пришлось бы искать ползунком
+        self._scroll_to_end()
 
         self._appending = False
 
@@ -1721,6 +1745,8 @@ class MainWindow(QMainWindow):
             # Зона только что раскрылась: полоса прокрутки таблицы
             # появилась вместе с ней, до этого прокручивать некуда
             self.record_table.scrollToBottom()
+            # Текст тоже открывается на последнем куске, а не на начале
+            self._scroll_to_end()
         else:
             target = self._stationary_height()
 
