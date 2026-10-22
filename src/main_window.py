@@ -1496,6 +1496,11 @@ class MainWindow(QMainWindow):
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if self.text_edit.toPlainText():
+            # Пустая строка перед полосой: без неё куски липнут друг
+            # к другу. QPlainTextEdit не умеет отступы абзацев, поэтому
+            # это отдельная пустая строка — в тексте она остаётся, и по
+            # ней видно, где кончилась одна запись и началась другая
+            cursor.insertBlock()
             cursor.insertBlock()
 
         mark = QTextBlockFormat()

@@ -95,8 +95,9 @@ class SeparatorTextTest(_WindowCase):
 
         self.assertNotIn("─", text)
         self.assertNotIn(mw.SEPARATOR_MARK, text)
-        # Между кусками остаётся пустая строка — и только она
-        self.assertEqual(text.strip(), "речь один\n\nречь два")
+        # Между кусками — пустая строка и полоса под ней: полоса
+        # занимает ещё одну строку, но ни одного своего символа
+        self.assertEqual(text.strip(), "речь один\n\n\nречь два")
 
     def test_title_visible_with_timecodes(self) -> None:
         self.window.timecodes_box.setChecked(True)
