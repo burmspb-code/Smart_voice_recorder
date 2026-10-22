@@ -30,9 +30,17 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QTextBlock,
+    QTextBlockFormat,
+    QTextCursor,
+    QTextFormat,
+)
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QFileDialog,
@@ -116,6 +124,12 @@ COLUMN_STATUS = 2
 COLUMN_LENGTH = 3
 COLUMN_SIZE = 4
 
+# Разделитель между кусками в окне: пустая строка, помеченная в
+# оформлении. Ни одного символа в тексте — в буфер обмена и в файл
+# такая граница не попадает, там остаётся только речь.
+SEPARATOR_MARK = "block-separator"
+SEPARATOR_BG = "#3a3648"
+
 COLUMN_NAMES = [
     "Папка",
     "Файл",
@@ -131,13 +145,14 @@ COLUMN_NAMES = [
 class TextBlock:
     """Кусок текста в окне и файл, из которого он взят.
 
-    Границы куска ищутся по строке-разделителю прямо в тексте окна.
-    Хранить смещения бесполезно: любая правка пользователя
-    в начале окна сдвинула бы их все.
+    Границы куска держит метка в оформлении пустой строки, а не
+    текст разделителя: текстом искать нельзя — пользователь его
+    правит, и куски склеиваются. Метка в оформлении переживает
+    правки и при этом не попадает в текст: в буфер обмена и в
+    файл `.txt` уходит чистая речь, без полосок и дат.
     """
 
     wav: Path
-    separator: str
 
 
 class MainWindow(QMainWindow):
@@ -166,6 +181,10 @@ class MainWindow(QMainWindow):
         # Правки пользователя, ещё не записанные на диск
         self.dirty = False
         self._appending = False
+
+        # Сколько символов ушло в буфер по ходу текущего распознавания:
+        # показываем это в итоговой строке состояния
+        self._copied_chars = 0
 
         # Сведения о модели: нужны, чтобы первый запуск был понятным
         self._model_info: model_store.ModelInfo | None = None
@@ -206,6 +225,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_top_row())
+        layout.addWidget(self._build_auto_row())
         layout.addLayout(self._build_control_row())
         layout.addWidget(self._build_level())
         layout.addWidget(self._build_details_zone())
@@ -326,9 +346,54 @@ class MainWindow(QMainWindow):
         self.model_box = QComboBox()
         for name, label in AVAILABLE_MODELS.items():
             self.model_box.addItem(label, name)
+        self.model_box.setToolTip(
+            "Модель распознавания.\n"
+            "Смена подхватывается при следующем запуске."
+        )
         row.addWidget(self.model_box, 2)
 
         return row
+
+    def _build_auto_row(self) -> QWidget:
+        """Переключатели автоматической расшифровки.
+
+        С ними обычный сценарий короткий: записал, нажал ■, текст
+        сам расшифровался и лёг в буфер обмена — вставлять можно
+        сразу, не открывая нижнюю зону.
+        """
+        holder = QWidget()
+        box = QHBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
+        # Галочки ставятся до подключения слотов: иначе начальная
+        # расстановка сохранилась бы в файл настроек и затёрла бы
+        # значения, которые там уже лежат
+        self.auto_transcribe_box = QCheckBox("Распознавать после остановки")
+        self.auto_transcribe_box.setChecked(self.settings.auto_transcribe)
+        self.auto_transcribe_box.setToolTip(
+            "Автораспознавание после нажатия клавиши Stop"
+        )
+        box.addWidget(self.auto_transcribe_box)
+
+        self.auto_copy_box = QCheckBox("Копировать в буфер")
+        self.auto_copy_box.setChecked(self.settings.auto_copy)
+        self.auto_copy_box.setToolTip("Скопировать текст последней записи")
+        box.addWidget(self.auto_copy_box)
+
+        self.timecodes_box = QCheckBox("Таймкоды")
+        self.timecodes_box.setChecked(self.settings.timecodes)
+        self.timecodes_box.setToolTip("Добавлять в текст распознавания")
+        box.addWidget(self.timecodes_box)
+
+        # Слоты подключаем последними: до этого момента расстановка
+        # галочек ещё не должна была ничего записывать в настройки
+        self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
+        self.auto_copy_box.toggled.connect(self._on_auto_copy)
+        self.timecodes_box.toggled.connect(self._on_timecodes)
+
+        box.addStretch(1)
+        return holder
 
     @staticmethod
     def _icon_label(name: str, tip: str) -> QLabel:
@@ -416,7 +481,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setIcon(icon("cancel"))
         self.cancel_button.setIconSize(QSize(22, 22))
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setToolTip("Записать заново, файл не сохранится")
+        self.cancel_button.setToolTip("Отменить последнюю запись")
         row.addWidget(self.cancel_button)
 
         row.addStretch(1)
@@ -817,11 +882,18 @@ class MainWindow(QMainWindow):
         Пока идёт распознавание, кнопка остаётся нажимаемой: ею
         прерывают работу. Выключать её нельзя — тогда исчез бы
         и перелив, и способ остановить распознавание.
+
+        Заодно обновляет доступность записи: одновременно писать
+        и распознавать нельзя, иначе пришлось бы молча ронять
+        распознавание по второму нажатию.
         """
         if self.transcriber.is_busy:
             self.transcribe_button.setEnabled(True)
             self._set_transcribe_caption("Остановить")
+            self._lock_record_during_transcribe(True)
             return
+
+        self._lock_record_during_transcribe(False)
 
         recorder = self.recorder
         recording = recorder.is_recording if recorder is not None else False
@@ -831,6 +903,27 @@ class MainWindow(QMainWindow):
 
         self.transcribe_button.setEnabled(has_pending and not recording)
         self._set_transcribe_caption("Распознать")
+
+    def _lock_record_during_transcribe(self, busy: bool) -> None:
+        """Гасит кнопку записи, пока идёт распознавание.
+
+        Модель не потокобезопасна и работает в своём потоке: вторая
+        запись заняла бы микрофон и CPU, а распознавание — тем более.
+        Раньше нажатие просто отменяло распознавание молча, и
+        половина файлов оставалась без текста.
+        """
+        if busy:
+            self.record_button.setEnabled(False)
+            self.record_button.setToolTip(
+                "Дождитесь окончания распознавания — потом можно будет записать снова"
+            )
+            return
+
+        recorder = self.recorder
+        if recorder is not None and recorder.is_recording:
+            return  # идёт запись — состояние кнопки ведёт _update_record_ui
+
+        self.record_button.setEnabled(True)
 
     # ----------------------------------------------------------------- запись
 
@@ -852,6 +945,15 @@ class MainWindow(QMainWindow):
 
     def _toggle_record(self) -> None:
         """Одна клавиша на три состояния: начать, пауза, продолжить."""
+        # Кнопку мы уже гасим, но сюда попадают и горячие клавиши,
+        # и автозапуск: микрофон должен быть один
+        if self.transcriber.is_busy:
+            self._say(
+                "Идёт распознавание — запись начнётся сразу после него",
+                WARNING,
+            )
+            return
+
         recorder = self._ensure_recorder()
 
         if recorder.is_recording:
@@ -930,6 +1032,23 @@ class MainWindow(QMainWindow):
         if peak < 0.01:
             message += "  — звук почти не записан"
         self._say(message, SUCCESS)
+
+        if self.auto_transcribe_box.isChecked():
+            self._transcribe()
+
+    # ------------------------------------------------- автоматическая расшифровка
+
+    def _on_auto_transcribe(self, checked: bool) -> None:
+        self.settings.auto_transcribe = checked
+        self.settings.save()
+
+    def _on_auto_copy(self, checked: bool) -> None:
+        self.settings.auto_copy = checked
+        self.settings.save()
+
+    def _on_timecodes(self, checked: bool) -> None:
+        self.settings.timecodes = checked
+        self.settings.save()
 
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)
@@ -1220,6 +1339,7 @@ class MainWindow(QMainWindow):
                 done, total, stopped
             ),
             on_error=lambda err: self.signals.transcribe_failed.emit(str(err)),
+            timecodes=self.timecodes_box.isChecked(),
         )
 
         if started:
@@ -1266,9 +1386,60 @@ class MainWindow(QMainWindow):
         else:
             remaining = len(storage.pending(self.recordings))
             suffix = f", осталось без текста: {remaining}" if remaining else ""
+            if self._copied_chars:
+                suffix += f", скопировано в буфер: {self._copied_chars} символов"
             self._say(f"Распознано файлов: {done}{suffix}", SUCCESS)
+            self._copied_chars = 0
 
     # ------------------------------------------------------------------ текст
+
+    def _insert_separator(self, title: str, text: str) -> None:
+        """Вставляет кусок текста вместе с разделителем перед ним.
+
+        Разделитель — серая полоска, и она видна всегда: с заголовком
+        «── дата · блок ──», когда включены таймкоды, и без единого
+        символа, когда они выключены. Метка при этом живёт в
+        оформлении блока, а не в тексте: в буфер обмена и в файл такая
+        граница не попадает, там остаётся только речь.
+        """
+        cursor = self.text_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.text_edit.toPlainText():
+            cursor.insertBlock()
+
+        mark = QTextBlockFormat()
+        mark.setProperty(QTextFormat.Property.UserProperty, SEPARATOR_MARK)
+        # Полоска видна всегда: граница между кусками не должна зависеть
+        # от того, включены ли метки времени
+        mark.setBackground(QColor(SEPARATOR_BG))
+        if title:
+            mark.setForeground(QBrush(QColor(MUTED)))
+            cursor.insertText(title)
+        cursor.setBlockFormat(mark)
+
+        # Текст куска — в отдельном блоке. Иначе метка попала бы
+        # в сам кусок (сохранять было бы нечего) и унаследовалась
+        # бы всеми следующими строками при вводе.
+        cursor.insertBlock()
+        cursor.setBlockFormat(QTextBlockFormat())
+        cursor.insertText(text)
+
+    def _separator_blocks(self) -> list[QTextBlock]:
+        """Блоки-разделители в порядке появления.
+
+        Идём по блокам документа, а не ищем текст: метка живёт
+        в оформлении и в тексте не читается.
+        """
+        marks = []
+        block = self.text_edit.document().begin()
+        while block.isValid():
+            if (
+                block.blockFormat().property(QTextFormat.Property.UserProperty)
+                == SEPARATOR_MARK
+            ):
+                marks.append(block)
+            block = block.next()
+        return marks
 
     def _append_text(self, wav: Path, text: str) -> None:
         """Добавляет распознанный текст в окно и запоминает, откуда он."""
@@ -1277,17 +1448,29 @@ class MainWindow(QMainWindow):
         # Секунды в разделителе: две записи в одну минуту должны
         # остаться разными кусками
         stamp = when.strftime("%d.%m.%Y %H:%M:%S") if when else "—"
-        separator = f"── {stamp} · {title} ──"
 
         self._appending = True
-        self.text_edit.appendPlainText(separator)
-        self.text_edit.appendPlainText("")
-        self.text_edit.appendPlainText(text)
+
+        # Разделитель всегда с меткой: с заголовком, если включены
+        # таймкоды, и пустой полосой без единого символа, если нет
+        title = f"── {stamp} · {title} ──" if self.timecodes_box.isChecked() else ""
+        self._insert_separator(title, text)
+
         self._appending = False
 
-        self.blocks.append(TextBlock(wav=wav, separator=separator))
+        self.blocks.append(TextBlock(wav=wav))
         self.dirty = False
         self._update_dirty()
+
+        # В буфер идёт только что распознанный кусок, а не всё окно:
+        # после ■ в буфер должен попасть ровно то, что он сейчас
+        # записал, иначе вставить «куда угодно» неудобно — в буфер
+        # уехала бы вся история разговора вместе с разделителями.
+        # Пустой текст тоже не кладём: стёртое содержимое буфера
+        # было бы не вернуть.
+        if self.auto_copy_box.isChecked() and text.strip():
+            QApplication.clipboard().setText(text.strip())
+            self._copied_chars = len(text.strip())
 
     def _on_text_changed(self) -> None:
         """Правка пользователя делает окно несохранённым."""
@@ -1303,39 +1486,32 @@ class MainWindow(QMainWindow):
     def _save_blocks(self) -> None:
         """Пишет правки из окна обратно в файлы .txt.
 
-        Куски разбираются по разделителям в текущем тексте окна,
-        поэтому правки в любом месте не сбивают границы.
+        Кусок идёт от своего разделителя до следующего: метки лежат
+        в оформлении, поэтому правки в любом месте не сбивают границы
+        и в текст просачивается только речь.
         """
         if not self.blocks:
             return
 
         content = self.text_edit.toPlainText()
 
-        # Где начинается каждый кусок
-        starts: list[int] = []
-        cursor = 0
-        for block in self.blocks:
-            found = content.find(block.separator, cursor)
-            if found < 0:
-                break  # разделитель удалён — этот кусок уже не отделить
-            starts.append(found)
-            cursor = found + len(block.separator)
-
-        if not starts:
-            self._say("Не найдены разделители, куски не разделены", WARNING)
+        marks = self._separator_blocks()
+        if len(marks) < len(self.blocks):
+            self._say("Разделители потеряны, куски не разделены", WARNING)
             return
 
         written = 0
-        for index, block in enumerate(self.blocks[: len(starts)]):
-            start = starts[index]
+        for index, block in enumerate(self.blocks):
+            # Тело куска начинается после разделителя, а кончается
+            # началом следующего разделителя (или концом окна)
+            start = marks[index].position() + len(marks[index].text()) + 1
+            end = (
+                marks[index + 1].position()
+                if index + 1 < len(marks)
+                else len(content)
+            )
 
-            # Тело куска начинается после строки-разделителя
-            line_end = content.find("\n", start)
-            body_start = line_end + 1 if line_end >= 0 else len(content)
-
-            body_end = starts[index + 1] if index + 1 < len(starts) else len(content)
-
-            chunk = content[body_start:body_end].strip()
+            chunk = content[start:end].strip()
             block.wav.with_suffix(".txt").write_text(chunk, encoding="utf-8")
             written += 1
 

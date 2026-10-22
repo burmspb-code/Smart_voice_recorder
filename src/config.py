@@ -106,7 +106,7 @@ def looks_nested(candidate: Path, root: Path) -> bool:
     try:
         resolved = candidate.resolve()
         root_resolved = root.resolve()
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return False
 
     return resolved.is_relative_to(root_resolved) and resolved != root_resolved
@@ -129,6 +129,13 @@ class Settings:
         self.model: str = DEFAULT_MODEL
         self.microphone: int | None = None  # None — выбрать автоматически
         self.last_block: str = ""
+        # Все три переключателя по умолчанию включены: обычный сценарий
+        # «записал → нажал ■ → текст в буфере» не должен требовать
+        # предварительной настройки, а метки времени пригодились тем,
+        # кто правит записи в окне.
+        self.auto_transcribe: bool = True
+        self.auto_copy: bool = True
+        self.timecodes: bool = True
         self.load()
 
     def load(self) -> None:
@@ -139,7 +146,7 @@ class Settings:
 
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             # Испорченный файл — начинаем с настроек по умолчанию
             return
 
@@ -154,6 +161,10 @@ class Settings:
 
         self.last_block = str(data.get("last_block") or "")
 
+        self.auto_transcribe = bool(data.get("auto_transcribe", True))
+        self.auto_copy = bool(data.get("auto_copy", True))
+        self.timecodes = bool(data.get("timecodes", True))
+
     def save(self) -> None:
         """Пишет настройки в файл. Папка создаётся при первом сохранении."""
         path = settings_file()
@@ -164,6 +175,9 @@ class Settings:
             "model": self.model,
             "microphone": self.microphone,
             "last_block": self.last_block,
+            "auto_transcribe": self.auto_transcribe,
+            "auto_copy": self.auto_copy,
+            "timecodes": self.timecodes,
         }
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"

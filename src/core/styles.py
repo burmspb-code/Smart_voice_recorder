@@ -8,7 +8,7 @@
 
 Всё оформление собрано здесь, в одном месте, а не размазано
 по виджетам. Виджеты, которым нужен особый вид, помечаются
-свойствами прямо в коде, а стили для них описаны в STYLESHEET:
+свойствами прямо в коде, а стили для них описаны в _stylesheet():
 
     label.setProperty("muted", True)     — приглушённый текст
     label.setProperty("state", "paused") — состояние индикатора
@@ -24,7 +24,11 @@ Qt не перечитывает таблицу стилей и виджет о�
 от них: границы, приглушённый текст, состояния наведения.
 """
 
-from PyQt6.QtCore import QLibraryInfo, QTranslator
+import tempfile
+from pathlib import Path
+
+from PyQt6.QtCore import QLibraryInfo, QPointF, Qt, QTranslator
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
 # --- Фон и поверхности -----------------------------------------------
@@ -69,7 +73,48 @@ PRIMARY_PRESSED = "#d72f26"
 # Предупреждение о несохранённых правках
 WARNING = "#e0a13a"
 
-STYLESHEET = f"""
+def check_mark_path() -> str:
+    """Рисует белую галочку и возвращает путь к файлу.
+
+    В Qt-стилях картинка приклеивается через url(), а встроенные
+    ресурсы Qt (:/qt-project.org/...) в PyQt6 живут не всегда.
+    Поэтому рисуем галочку сами и кладём во временную папку.
+
+    Вызывать только после создания QApplication: QPixmap без него
+    завершает процесс, а не бросает исключение.
+    """
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(QColor(0, 0, 0, 0))
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(5)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+
+    path = QPainterPath(QPointF(8, 17))
+    path.lineTo(QPointF(13.5, 23))
+    path.lineTo(QPointF(24, 10))
+    painter.drawPath(path)
+    painter.end()
+
+    folder = Path(tempfile.gettempdir()) / "smart_voice_recorder"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / "check.png"
+    pixmap.save(str(target))
+    return target.as_posix()
+
+def _stylesheet(check_mark: str) -> str:
+    """Собирает таблицу стилей.
+
+    Отдельной функцией, а не константой модуля: путь к галочке
+    появляется только после создания QApplication.
+    """
+    CHECK_MARK = check_mark
+    return f"""
 QWidget {{
     font-family: "Segoe UI", sans-serif;
     font-size: 13px;
@@ -440,13 +485,53 @@ QMessageBox QLabel {{
     background: transparent;
 }}
 
+/* Подсказки закругляем тем же радиусом, что и остальные края,
+   иначе на тёмном фоне они выглядят чужеродными квадратами */
 QToolTip {{
     background: {SURFACE};
     color: {TEXT};
     border: 1px solid {BORDER_STRONG};
-    padding: 4px 6px;
+    border-radius: 6px;
+    padding: 6px 8px;
 }}
-"""
+
+/* --- Переключатели ----------------------------------------------------- */
+
+QCheckBox {{
+    color: {TEXT};
+    font-size: 13px;
+    spacing: 8px;
+    padding: 2px 0;
+}}
+
+QCheckBox:disabled {{
+    color: {DISABLED_TEXT};
+}}
+
+/* Галочка белая: на тёмном фоне голубой значок теряется,
+   а белый читается сразу и выглядит как отметка «включено» */
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 4px;
+    background-color: {SURFACE};
+}}
+
+QCheckBox::indicator:hover {{
+    border-color: {FOCUS};
+}}
+
+QCheckBox::indicator:checked {{
+    background-color: {FOCUS};
+    border-color: {FOCUS};
+    image: url("{CHECK_MARK}");
+}}
+
+QCheckBox::indicator:disabled {{
+    background-color: {DISABLED_BG};
+    border-color: {DISABLED_BORDER};
+}}"""
 
 
 def apply_property(widget: QWidget, name: str, value: bool) -> None:
@@ -482,6 +567,10 @@ def apply_locale(app: QApplication) -> None:
 
 
 def apply_theme(app: QApplication) -> None:
-    """Включает оформление на всё приложение."""
+    """Включает оформление на всё приложение.
+
+    Галочка рисуется здесь, а не на уровне модуля: QPixmap требует
+    уже созданного QApplication.
+    """
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(_stylesheet(check_mark_path()))

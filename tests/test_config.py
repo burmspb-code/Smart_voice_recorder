@@ -33,6 +33,10 @@ class SettingsTest(unittest.TestCase):
         settings = config.Settings()
         self.assertIsNone(settings.microphone)
         self.assertEqual(settings.last_block, "")
+        # Все три переключателя при первом запуске включены
+        self.assertTrue(settings.auto_transcribe)
+        self.assertTrue(settings.auto_copy)
+        self.assertTrue(settings.timecodes)
 
     def test_round_trip(self) -> None:
         settings = config.Settings()
@@ -40,6 +44,8 @@ class SettingsTest(unittest.TestCase):
         settings.model = "small"
         settings.microphone = 3
         settings.last_block = "идея"
+        settings.auto_transcribe = True
+        settings.auto_copy = False
         settings.save()
 
         again = config.Settings()
@@ -48,6 +54,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(again.model, "small")
         self.assertEqual(again.microphone, 3)
         self.assertEqual(again.last_block, "идея")
+        self.assertTrue(again.auto_transcribe)
+        self.assertFalse(again.auto_copy)
 
     def test_broken_file_keeps_defaults(self) -> None:
         path = config.settings_file()
