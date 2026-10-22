@@ -18,6 +18,11 @@ import sys
 
 
 def main() -> int:
+    # Ошибки пишем в файл: без консоли падение иначе ничем не объяснено
+    from src.crash_log import install
+
+    install()
+
     from src.main_window import run
 
     return run()
