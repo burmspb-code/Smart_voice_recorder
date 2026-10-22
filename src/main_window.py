@@ -247,6 +247,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_level())
         layout.addWidget(self._build_details_zone())
 
+        # Пружина держит содержимое сверху, а строку состояния внизу.
+        # Без неё лишняя высота достаётся строкам выше зоны, и пока
+        # окно догоняет анимацию, всё содержимое съезжает вниз
+        layout.addStretch(1)
+
         self.status = QLabel("Готово")
         # Свойство kind задаёт цвет по смыслу и перебивает приглушённый
         # текст, поэтому muted здесь не нужен
@@ -306,12 +311,20 @@ class MainWindow(QMainWindow):
         self.details_zone = zone
         zone.setMaximumHeight(0)
 
+        # Высота окна без зоны. Считается до старта анимации, а на
+        # каждом её кадре к ней прибавляется текущая высота зоны
+        self._zone_base = 0
+
         # Зона поднимается и опускается анимацией высоты:
         # анимировать геометрию внутри слоя неудобно, а
         # maximumHeight работает устойчиво при любой длине текста
         self._zone_animation = QPropertyAnimation(zone, b"maximumHeight")
         self._zone_animation.setDuration(180)
-        # Окно ужимается вместе с зоной, но только когда она доехала
+        # Окно ужимается вместе с зоной, кадр в кадр. Если ужимать его
+        # только после анимации, освободившееся место на миг раздвигает
+        # строки выше зоны, и всё содержимое проваливается вниз
+        self._zone_animation.valueChanged.connect(self._follow_zone)
+        # Последний штрих: прокрутка таблицы и точная высота
         self._zone_animation.finished.connect(self._fit_window)
 
         return zone
@@ -1719,21 +1732,38 @@ class MainWindow(QMainWindow):
     def _show_zone(self) -> None:
         self.zone_button.setChecked(True)
         self.zone_button.setToolTip("Скрыть записи и текст распознавания")
-
-        start = self.details_zone.maximumHeight()
-        self._zone_animation.stop()
-        self._zone_animation.setStartValue(start)
-        self._zone_animation.setEndValue(self._zone_height())
-        self._zone_animation.start()
+        self._move_zone(self._zone_height())
 
     def _hide_zone(self) -> None:
         self.zone_button.setChecked(False)
         self.zone_button.setToolTip("Записи и текст распознавания")
+        self._move_zone(0)
+
+    def _move_zone(self, target: int) -> None:
+        """Ведёт зону от текущей высоты к target.
+
+        Высота окна без зоны меряется здесь, до старта: во время
+        анимации зона меняется, и мерить её на каждом кадре незачем.
+        """
+        self._zone_base = self._stationary_height()
 
         self._zone_animation.stop()
         self._zone_animation.setStartValue(self.details_zone.maximumHeight())
-        self._zone_animation.setEndValue(0)
+        self._zone_animation.setEndValue(target)
         self._zone_animation.start()
+
+    def _follow_zone(self, height: int) -> None:
+        """Кадр анимации: окно тянется за зоной.
+
+        Высота окна — постоянная часть плюс то, что сейчас занимает
+        зона. Так содержимое выше зоны стоит на месте, а не уезжает
+        вниз, пока окно ждёт конца анимации.
+        """
+        screen = QApplication.primaryScreen()
+        limit = screen.availableGeometry().height() - 90 if screen else 800
+
+        wanted = self._zone_base + int(height)
+        self.resize(self.width(), max(300, min(wanted, limit)))
 
     # ------------------------------------------------------------------ папка
 
