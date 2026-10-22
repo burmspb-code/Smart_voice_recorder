@@ -56,4 +56,13 @@ def icon(name: str, size: int = 20) -> QIcon:
     scaled.setDevicePixelRatio(DENSITY)
 
     # QIcon берёт именно QPixmap, из QImage его напрямую не сделать
-    return QIcon(QPixmap.fromImage(scaled))
+    picture = QPixmap.fromImage(scaled)
+
+    # На отключённой кнопке Qt сама обесцвечивает значок под серый
+    # disabled-вид. Значки цветные, и цвет нужен всегда: тот же кадр
+    # кладём и для отключённого состояния, иначе кнопка «стоп» и
+    # «отменить» в покое выглядят серыми пятнами
+    result = QIcon()
+    result.addPixmap(picture, QIcon.Mode.Normal)
+    result.addPixmap(picture, QIcon.Mode.Disabled)
+    return result
