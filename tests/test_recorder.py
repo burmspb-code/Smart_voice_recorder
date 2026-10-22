@@ -16,8 +16,10 @@ from typing import ClassVar
 import numpy as np
 
 from src.recorder import (
+    RECORDING_GAIN,
     SAMPLE_RATE,
     Recorder,
+    _amplify,
     _distinctive,
     _group_candidates,
     _match_endpoint,
@@ -117,6 +119,59 @@ class SpillTest(unittest.TestCase):
         recorder._voice_seen = True
 
         self.assertAlmostEqual(recorder._duration(), 63.0)
+
+
+class GainTest(unittest.TestCase):
+    """Усиление записи: громче на десятую часть, без переполнения."""
+
+    def test_sound_gets_louder(self) -> None:
+        quieter = np.array([0, 1000, -1000], dtype=np.int16)
+
+        louder = _amplify(quieter)
+
+        self.assertEqual(louder.dtype, np.int16)
+        self.assertEqual(louder[0], 0)
+        self.assertEqual(louder[1], round(1000 * RECORDING_GAIN))
+        self.assertEqual(louder[2], round(-1000 * RECORDING_GAIN))
+
+    def test_full_scale_is_clipped_not_wrapped(self) -> None:
+        # Громкий звук после усиления не должен менять знак: иначе
+        # на месте громкого хлопка в файле окажется треск
+        loud = np.array([32000, -32000, 32767], dtype=np.int16)
+
+        louder = _amplify(loud)
+
+        self.assertEqual(louder[0], 32767)
+        self.assertEqual(louder[1], -32768)
+        self.assertEqual(louder[2], 32767)
+
+    def test_source_chunk_is_left_alone(self) -> None:
+        source = np.array([1000, -1000], dtype=np.int16)
+
+        _amplify(source)
+
+        self.assertEqual(source.tolist(), [1000, -1000])
+
+    def test_saved_file_is_louder(self) -> None:
+        # Весь путь целиком: колбэк -> буфер -> черновик -> wav
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+
+        recorder = Recorder()
+        recorder._path = root / "g.wav"
+        recorder._spill_path = root / "g.raw"
+
+        tone = np.full(SAMPLE_RATE, 1000, dtype=np.int16)
+        recorder._audio_callback(tone.reshape(-1, 1), len(tone), None, None)
+        recorder._stop.set()
+        recorder._wait_worker()
+
+        with wave.open(str(recorder._path), "rb") as wav:
+            data = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
+
+        self.assertEqual(len(data), SAMPLE_RATE)
+        self.assertEqual(int(np.abs(data).max()), round(1000 * RECORDING_GAIN))
 
 
 class PhysicalMicrophoneTest(unittest.TestCase):
