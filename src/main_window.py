@@ -103,6 +103,10 @@ AUTO_STOP_WARN = 2.0
 # а значок вровень с кнопкой давит на неё
 BUTTON_ICON = 28
 
+# Значок перед полем верхней строки. Поля в оформлении по 34 пикселя,
+# и значок занимает эту высоту целиком; на 36 строка уже подрастает
+ROW_ICON = 34
+
 
 class Signals(QObject):
     """Мост из рабочих потоков в интерфейс.
@@ -461,9 +465,9 @@ class MainWindow(QMainWindow):
         написано в самом поле. Смысл остаётся в подсказке.
         """
         label = QLabel()
-        label.setPixmap(icon(name, 20).pixmap(20, 20))
+        label.setPixmap(icon(name, ROW_ICON).pixmap(ROW_ICON, ROW_ICON))
         label.setToolTip(tip)
-        label.setFixedWidth(24)
+        label.setFixedWidth(ROW_ICON)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
 
