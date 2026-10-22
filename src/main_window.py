@@ -132,8 +132,11 @@ class Signals(QObject):
 
 # Столбцы таблицы записей
 # Виды сообщений внизу окна. Цвет выбирается по смыслу:
-# успех, предупреждение и ошибка не должны выглядеть одинаково
+# успех, предупреждение и ошибка не должны выглядеть одинаково.
+# У BUSY свой цвет: пока идёт запись или распознавание, строка должна
+# притягивать взгляд — иначе кажется, что приложение просто зависло
 INFO = "info"
+BUSY = "busy"
 SUCCESS = "success"
 WARNING = "warning"
 ERROR = "error"
@@ -1037,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._auto_stop_warned = False
         self._auto_stopped = False
         self._set_recording_ui(True)
-        self._say(f"Идёт запись → {target.name}")
+        self._say(f"Идёт запись → {target.name}", BUSY)
 
     def _stop_record(self) -> None:
         """Останавливает запись и сразу сохраняет файл.
@@ -1051,7 +1054,7 @@ class MainWindow(QMainWindow):
 
         recorder.stop()
         self._set_recording_ui(False)
-        self._say("Сохраняю запись…")
+        self._say("Сохраняю запись…", BUSY)
 
     def _cancel_record(self) -> None:
         self._ensure_recorder().cancel()
@@ -1082,7 +1085,7 @@ class MainWindow(QMainWindow):
             self.record_button.setIcon(icon("play", BUTTON_ICON))
             self.record_button.setToolTip("Продолжить запись")
             self.indicator.set_state(PAUSED)
-            self._say("Пауза — нажмите ту же клавишу, чтобы продолжить")
+            self._say("Пауза — нажмите ту же клавишу, чтобы продолжить", BUSY)
         else:
             self.record_button.setIcon(icon("pause", BUTTON_ICON))
             self.record_button.setToolTip("Пауза")
@@ -1186,7 +1189,7 @@ class MainWindow(QMainWindow):
         # Пока модель не готова, это сообщение главное: обычные строки
         # статуса его не перебивают (см. _say).
         self._model_loading = True
-        self._set_status(message, INFO)
+        self._set_status(message, BUSY)
 
         self.model_store.load_async(
             name,
@@ -1234,7 +1237,7 @@ class MainWindow(QMainWindow):
             seconds = int(time.monotonic() - self._model_loading_since)
             self._set_status(
                 f"Модель «{name}» скачана, загружаю в память… ({seconds} с)",
-                INFO,
+                BUSY,
             )
             return
 
@@ -1275,7 +1278,7 @@ class MainWindow(QMainWindow):
             # Объём пока не известен — считаем только уже скачанное
             message = f"Скачиваю модель «{name}»: уже {self._progress_size(done)}"
 
-        self._set_status(message, INFO)
+        self._set_status(message, BUSY)
 
     def _progress_size(self, size: int) -> str:
         """Скачанные байты в компактный вид. Ноль не становится «неизвестно»."""
@@ -1407,7 +1410,7 @@ class MainWindow(QMainWindow):
         """
         if self.transcriber.is_busy:
             self.transcriber.cancel()
-            self._say("Останавливаю распознавание…", WARNING)
+            self._say("Останавливаю распознавание…", BUSY)
             return
 
         waiting = storage.pending(self.recordings, block=self._current_block())
@@ -1416,7 +1419,7 @@ class MainWindow(QMainWindow):
             return
 
         target = waiting[0]
-        self._say(f"Распознаю {target.name}")
+        self._say(f"Распознаю {target.name}", BUSY)
         self._pulse_start("Распознаю…")
 
         started = self.transcriber.start(
@@ -1454,7 +1457,7 @@ class MainWindow(QMainWindow):
 
     def _on_file_started(self, wav: str) -> None:
         self._pulse_start(f"Распознаю {Path(wav).name}…")
-        self._say(f"Распознаю {Path(wav).name}, это займёт время")
+        self._say(f"Распознаю {Path(wav).name}, это займёт время", BUSY)
 
     def _on_file_done(self, wav: str, lines: int, text: str) -> None:
         self._append_text(Path(wav), text)
