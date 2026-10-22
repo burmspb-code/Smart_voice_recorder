@@ -1670,10 +1670,13 @@ class MainWindow(QMainWindow):
 
         Пока зона свёрнута, её размер не посчитать, поэтому на миг
         снимаем ограничение, меряем и возвращаем как было.
+
+        Меряется только высота: adjustSize() подогнал бы ещё и ширину
+        центрального виджета под подсказку размера, и окно на миг
+        теряло бы ширину.
         """
         saved = self.details_zone.maximumHeight()
         self.details_zone.setMaximumHeight(zone_limit)
-        self.centralWidget().adjustSize()
         needed = self.centralWidget().sizeHint().height()
         self.details_zone.setMaximumHeight(saved)
         return needed
@@ -1693,7 +1696,6 @@ class MainWindow(QMainWindow):
 
         saved = self.details_zone.maximumHeight()
         self.details_zone.setMaximumHeight(16777215)
-        self.details_zone.adjustSize()
         needed = self.details_zone.sizeHint().height()
         self.details_zone.setMaximumHeight(saved)
 
