@@ -31,6 +31,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import (
+    QAction,
     QBrush,
     QColor,
     QTextBlock,
@@ -50,6 +51,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -64,8 +66,8 @@ import storage
 from src import config, model_store
 from src.config import (
     AUTO_STOP_CHOICES,
+    AUTO_STOP_LABELS,
     AVAILABLE_MODELS,
-    DEFAULT_AUTO_STOP_SECONDS,
     Settings,
 )
 from src.core.icons import app_icon, icon
@@ -402,33 +404,32 @@ class MainWindow(QMainWindow):
         box.addWidget(self.timecodes_box)
 
         # АвтоСтоп: микрофон замолчал — значит, человек закончил
-        # и забыл нажать ■. Поле сделано как у микрофона наверху:
-        # значок с подсказкой и раскрывающийся список сроков.
-        box.addWidget(self._icon_label("stop", "АвтоСтоп"))
-
-        self.auto_stop_box = QComboBox()
-        self.auto_stop_box.setMinimumWidth(90)
-        self.auto_stop_box.setToolTip(
-            "АвтоСтоп: остановить запись, если микрофон замолчал.\n"
+        # и забыл нажать ■. Слово написано в самом поле, а сроки
+        # раскрываются по нажатию: поэтому это кнопка с меню, а не
+        # поле выбора со значком рядом.
+        self.auto_stop_button = QPushButton("АвтоСтоп")
+        self.auto_stop_button.setObjectName("autoStop")
+        self.auto_stop_button.setToolTip(
+            "Остановить запись, если микрофон замолчал.\n"
             "«нет» — запись идёт, пока не нажмёте ■."
         )
-        self.auto_stop_box.addItem("нет", None)
-        for seconds in AUTO_STOP_CHOICES:
-            self.auto_stop_box.addItem(f"{seconds} с", seconds)
 
-        saved = self.settings.auto_stop_seconds
-        chosen = 0 if saved is None else self.auto_stop_box.findData(saved)
-        if chosen < 0:
-            chosen = self.auto_stop_box.findData(DEFAULT_AUTO_STOP_SECONDS)
-        self.auto_stop_box.setCurrentIndex(chosen)
-        box.addWidget(self.auto_stop_box)
+        self.auto_stop_menu = QMenu(self)
+        for seconds in (None, *AUTO_STOP_CHOICES):
+            title = "нет" if seconds is None else AUTO_STOP_LABELS[seconds]
+            action = self.auto_stop_menu.addAction(title)
+            action.setCheckable(True)
+            action.setData(seconds)
+        self.auto_stop_button.setMenu(self.auto_stop_menu)
+        self._mark_auto_stop()
+        box.addWidget(self.auto_stop_button)
 
         # Слоты подключаем последними: до этого момента расстановка
         # галочек ещё не должна была ничего записывать в настройки
         self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
         self.auto_copy_box.toggled.connect(self._on_auto_copy)
         self.timecodes_box.toggled.connect(self._on_timecodes)
-        self.auto_stop_box.currentIndexChanged.connect(self._on_auto_stop)
+        self.auto_stop_menu.triggered.connect(self._on_auto_stop)
 
         box.addStretch(1)
         return holder
@@ -1093,14 +1094,17 @@ class MainWindow(QMainWindow):
         self.settings.timecodes = checked
         self.settings.save()
 
-    def _on_auto_stop(self) -> None:
+    def _on_auto_stop(self, action: QAction) -> None:
         """Выбран новый срок автостопа (или он выключен вовсе)."""
-        seconds = self.auto_stop_box.currentData()
-        if seconds is None:
-            self.settings.auto_stop_seconds = None
-        elif isinstance(seconds, int):
-            self.settings.auto_stop_seconds = seconds
+        self.settings.auto_stop_seconds = action.data()
         self.settings.save()
+        self._mark_auto_stop()
+
+    def _mark_auto_stop(self) -> None:
+        """Отмечает в списке тот срок, который сейчас в настройках."""
+        current = self.settings.auto_stop_seconds
+        for action in self.auto_stop_menu.actions():
+            action.setChecked(action.data() == current)
 
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)

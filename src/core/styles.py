@@ -309,6 +309,39 @@ QAbstractItemView::item:selected {{
     color: {ON_ACCENT};
 }}
 
+/* Меню сроков автостопа. Обычное меню Qt рисуется системными цветами:
+   на тёмном фоне светлая полоса выглядит чужой, поэтому фон, рамка
+   и подсветка строки заданы здесь. */
+
+QMenu {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 4px;
+    color: {TEXT};
+}}
+
+QMenu::item {{
+    padding: 6px 26px 6px 30px;
+    border-radius: 4px;
+}}
+
+QMenu::item:selected {{
+    background-color: {ACTIVE};
+    color: {ACTIVE_TEXT};
+}}
+
+/* Отметка выбранного срока: слева от строки, как у галочек */
+QMenu::indicator {{
+    width: 16px;
+    height: 16px;
+    margin-left: 8px;
+}}
+
+QMenu::indicator:checked {{
+    image: url("{CHECK_MARK}");
+}}
+
 /* --- Список записей --------------------------------------------------- */
 
 QListWidget::item {{
@@ -350,6 +383,18 @@ QPushButton:disabled {{
     background-color: {DISABLED_BG};
     color: {DISABLED_TEXT};
     border-color: {DISABLED_BORDER};
+}}
+
+/* Поле автостопа: слово «АвтоСтоп» написано в нём самом, значка
+   рядом нет. Список сроков раскрывается по нажатию, поэтому это
+   кнопка с меню, но выглядеть она должна полем, а не клавишей:
+   отсюда обычное начертание и место справа под стрелку списка. */
+
+QPushButton#autoStop {{
+    color: {ON_ACCENT};
+    font-weight: normal;
+    padding: 6px 26px 6px 10px;
+    text-align: left;
 }}
 
 /* Кнопка-переключатель зоны: нажата — значит зона раскрыта */
