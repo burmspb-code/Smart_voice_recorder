@@ -44,6 +44,12 @@ MODEL_SIZES_MB = {
     "medium": 1500,
 }
 
+# Сколько секунд тишины считать концом записи. Варианты для выбора.
+AUTO_STOP_CHOICES = (3, 5, 10, 30)
+
+# Сколько секунд тишины считать концом записи по умолчанию.
+DEFAULT_AUTO_STOP_SECONDS = 5
+
 
 def settings_dir() -> Path:
     """Папка настроек в профиле пользователя.
@@ -136,6 +142,11 @@ class Settings:
         self.auto_transcribe: bool = True
         self.auto_copy: bool = True
         self.timecodes: bool = True
+        # Останавливать запись, если микрофон замолчал. Молчание
+        # микрофона и пауза самого человека — разные вещи, поэтому
+        # автостоп можно выключить одной галочкой.
+        self.auto_stop: bool = True
+        self.auto_stop_seconds: int = DEFAULT_AUTO_STOP_SECONDS
         self.load()
 
     def load(self) -> None:
@@ -165,6 +176,16 @@ class Settings:
         self.auto_copy = bool(data.get("auto_copy", True))
         self.timecodes = bool(data.get("timecodes", True))
 
+        self.auto_stop = bool(data.get("auto_stop", True))
+
+        seconds = data.get("auto_stop_seconds", DEFAULT_AUTO_STOP_SECONDS)
+        if (
+            isinstance(seconds, int)
+            and not isinstance(seconds, bool)
+            and seconds > 0
+        ):
+            self.auto_stop_seconds = seconds
+
     def save(self) -> None:
         """Пишет настройки в файл. Папка создаётся при первом сохранении."""
         path = settings_file()
@@ -178,6 +199,8 @@ class Settings:
             "auto_transcribe": self.auto_transcribe,
             "auto_copy": self.auto_copy,
             "timecodes": self.timecodes,
+            "auto_stop": self.auto_stop,
+            "auto_stop_seconds": self.auto_stop_seconds,
         }
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
