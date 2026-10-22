@@ -1824,8 +1824,7 @@ class MainWindow(QMainWindow):
 
         if not self._auto_stop_warned:
             self._auto_stop_warned = True
-            left = max(1, round(limit - silence))
-            self._say(f"Тишина — остановлю запись через {left} с", WARNING)
+            self._say("Тишина — остановлю запись", WARNING)
 
         if silence >= limit:
             self._auto_stopped = True
