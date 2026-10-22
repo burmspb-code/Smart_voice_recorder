@@ -33,6 +33,34 @@ class FormatTextTest(unittest.TestCase):
         self.assertEqual(format_text([]), "")
 
 
+class TimecodesTest(unittest.TestCase):
+    """Метки времени можно не ставить: они мешают чистому тексту."""
+
+    def setUp(self) -> None:
+        # Между кусками больше двух секунд тишины — это новый абзац
+        self.segments = [(0.0, 1.0, "привет"), (75.0, 76.0, "через минуту")]
+
+    def test_with_timecodes(self) -> None:
+        self.assertEqual(
+            format_text(self.segments, timecodes=True),
+            "[00:00] привет\n\n[01:15] через минуту",
+        )
+
+    def test_without_timecodes(self) -> None:
+        self.assertEqual(
+            format_text(self.segments, timecodes=False),
+            "привет\n\nчерез минуту",
+        )
+
+    def test_paragraphs_survive_without_timecodes(self) -> None:
+        segments = [(0.0, 1.0, "первый"), (5.0, 6.0, "второй")]
+
+        self.assertEqual(
+            format_text(segments, timecodes=False),
+            "первый\n\nвторой",
+        )
+
+
 class Segment:
     """Один кусок речи, как его отдаёт faster-whisper."""
 
@@ -75,9 +103,21 @@ class TranscribeFileTest(unittest.TestCase):
         lines, text, finished = transcribe_file(
             model, wav, should_cancel=lambda: True
         )
-
         self.assertEqual((lines, text, finished), (0, "", False))
         self.assertFalse(wav.with_suffix(".txt").exists())
+
+    def test_file_on_disk_has_no_timecodes_when_off(self) -> None:
+        wav = self._wav_file()
+        model = WhisperStub([Segment(0.0, 1.0, "привет"), Segment(2.0, 3.0, "мир")])
+
+        _lines, _text, _finished = transcribe_file(model, wav, timecodes=False)
+
+        # В файл уходит чистая речь: без меток и без разделителей,
+        # чтобы текст можно было отдать другой программе
+        self.assertEqual(
+            wav.with_suffix(".txt").read_text(encoding="utf-8"),
+            "привет\nмир",
+        )
 
 
 class VadBrokenStub(WhisperStub):
