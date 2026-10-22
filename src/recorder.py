@@ -137,6 +137,20 @@ _STOPWORDS = frozenset(
     }
 )
 
+# То же самое по-русски. Windows с русским языком называет устройства
+# «Микрофон (Realtek(R) Audio)», и слово «Микрофон» есть и в имени из
+# PortAudio, и в описании из реестра — по нему узнавался любой микрофон,
+# поэтому все устройства сливались в одно. Здесь основы, а не целые
+# слова: «звук», «звуковая», «звуковых» — одно и то же.
+_STOPSTEMS = (
+    "аудио",
+    "звук",
+    "микрофон",
+    "устройств",
+    "запис",
+    "вход",
+)
+
 # Индекс PortAudio -> ключ физического устройства (endpoint из реестра
 # либо имя). Заполняется в candidate_devices() и служит default_device():
 # индекс по умолчанию у Windows может быть дублем того же микрофона
@@ -207,7 +221,9 @@ def _distinctive(description: str) -> set[str]:
     return {
         word
         for word in lowered.split()
-        if len(word) >= 3 and word not in _STOPWORDS
+        if len(word) >= 3
+        and word not in _STOPWORDS
+        and not word.startswith(_STOPSTEMS)
     }
 
 
