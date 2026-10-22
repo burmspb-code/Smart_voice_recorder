@@ -45,7 +45,7 @@ MODEL_SIZES_MB = {
 }
 
 # Сколько секунд тишины считать концом записи. Варианты для выбора.
-AUTO_STOP_CHOICES = (3, 5, 10, 30)
+AUTO_STOP_CHOICES = (3, 5, 10)
 
 # Сколько секунд тишины считать концом записи по умолчанию.
 DEFAULT_AUTO_STOP_SECONDS = 5
@@ -142,11 +142,11 @@ class Settings:
         self.auto_transcribe: bool = True
         self.auto_copy: bool = True
         self.timecodes: bool = True
-        # Останавливать запись, если микрофон замолчал. Молчание
-        # микрофона и пауза самого человека — разные вещи, поэтому
-        # автостоп можно выключить одной галочкой.
-        self.auto_stop: bool = True
-        self.auto_stop_seconds: int = DEFAULT_AUTO_STOP_SECONDS
+        # Авто-стоп: срок тишины, после которого запись останавливается
+        # сама. None — автостоп выключен. Молчание микрофона и пауза
+        # самого человека — разные вещи, поэтому выключить автостоп
+        # можно в любой момент.
+        self.auto_stop_seconds: int | None = DEFAULT_AUTO_STOP_SECONDS
         self.load()
 
     def load(self) -> None:
@@ -176,15 +176,29 @@ class Settings:
         self.auto_copy = bool(data.get("auto_copy", True))
         self.timecodes = bool(data.get("timecodes", True))
 
-        self.auto_stop = bool(data.get("auto_stop", True))
+        self.auto_stop_seconds = self._read_auto_stop(data)
+
+    def _read_auto_stop(self, data: dict) -> int | None:
+        """Срок автостопа из настроек. None — автостоп выключен.
+
+        Раньше хранились две величины: галочка «включено» и срок.
+        Старый файл читаем как есть, иначе выключенный автостоп
+        включился бы сам при первом же запуске.
+        """
+        # Прежний формат: галочка и срок лежали отдельно
+        if "auto_stop" in data and not data["auto_stop"]:
+            return None
 
         seconds = data.get("auto_stop_seconds", DEFAULT_AUTO_STOP_SECONDS)
-        if (
-            isinstance(seconds, int)
-            and not isinstance(seconds, bool)
-            and seconds > 0
-        ):
-            self.auto_stop_seconds = seconds
+        if seconds is None:
+            return None
+
+        # Список в окне короткий и постоянный. Значение вне списка
+        # превратилось бы в лишний пункт, которого там быть не должно,
+        # поэтому такой срок заменяется на обычный
+        if seconds in AUTO_STOP_CHOICES:
+            return seconds
+        return DEFAULT_AUTO_STOP_SECONDS
 
     def save(self) -> None:
         """Пишет настройки в файл. Папка создаётся при первом сохранении."""
@@ -199,7 +213,6 @@ class Settings:
             "auto_transcribe": self.auto_transcribe,
             "auto_copy": self.auto_copy,
             "timecodes": self.timecodes,
-            "auto_stop": self.auto_stop,
             "auto_stop_seconds": self.auto_stop_seconds,
         }
         path.write_text(

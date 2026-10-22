@@ -37,8 +37,7 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(settings.auto_transcribe)
         self.assertTrue(settings.auto_copy)
         self.assertTrue(settings.timecodes)
-        # Остановка по тишине тоже включена, срок — пять секунд
-        self.assertTrue(settings.auto_stop)
+        # Авто-стоп тоже включён, срок — пять секунд
         self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
 
     def test_round_trip(self) -> None:
@@ -49,7 +48,6 @@ class SettingsTest(unittest.TestCase):
         settings.last_block = "идея"
         settings.auto_transcribe = True
         settings.auto_copy = False
-        settings.auto_stop = False
         settings.auto_stop_seconds = 10
         settings.save()
 
@@ -61,8 +59,17 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(again.last_block, "идея")
         self.assertTrue(again.auto_transcribe)
         self.assertFalse(again.auto_copy)
-        self.assertFalse(again.auto_stop)
         self.assertEqual(again.auto_stop_seconds, 10)
+
+    def test_disabled_auto_stop_survives(self) -> None:
+        # Выключенный автостоп — это пустое значение срока
+        settings = config.Settings()
+        settings.auto_stop_seconds = None
+        settings.save()
+
+        again = config.Settings()
+
+        self.assertIsNone(again.auto_stop_seconds)
 
     def test_nonsense_timeout_keeps_default(self) -> None:
         path = config.settings_file()
@@ -85,15 +92,59 @@ class SettingsTest(unittest.TestCase):
 
         self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
 
-    def test_custom_timeout_survives(self) -> None:
-        # Срок можно задать руками, даже если его нет в списке выбора
+    def test_timeout_outside_the_list_keeps_default(self) -> None:
+        # В окне список короткий и постоянный, поэтому срок вне его
+        # заменяется на обычный, а не появляется лишним пунктом
         path = config.settings_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"auto_stop_seconds": 7}', encoding="utf-8")
 
         settings = config.Settings()
 
-        self.assertEqual(settings.auto_stop_seconds, 7)
+        self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
+
+    def test_timeout_from_the_list_survives(self) -> None:
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"auto_stop_seconds": 10}', encoding="utf-8")
+
+        settings = config.Settings()
+
+        self.assertEqual(settings.auto_stop_seconds, 10)
+
+    def test_null_timeout_means_disabled(self) -> None:
+        # Пустой срок — это выключенный автостоп
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"auto_stop_seconds": null}', encoding="utf-8")
+
+        settings = config.Settings()
+
+        self.assertIsNone(settings.auto_stop_seconds)
+
+    def test_old_format_with_disabled_checkbox_stays_disabled(self) -> None:
+        # Прежний формат хранил галочку и срок отдельно: выключенная
+        # галочка не должна включиться сама
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"auto_stop": false, "auto_stop_seconds": 5}', encoding="utf-8"
+        )
+
+        settings = config.Settings()
+
+        self.assertIsNone(settings.auto_stop_seconds)
+
+    def test_old_format_with_enabled_checkbox_keeps_timeout(self) -> None:
+        path = config.settings_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"auto_stop": true, "auto_stop_seconds": 10}', encoding="utf-8"
+        )
+
+        settings = config.Settings()
+
+        self.assertEqual(settings.auto_stop_seconds, 10)
 
     def test_broken_file_keeps_defaults(self) -> None:
         path = config.settings_file()

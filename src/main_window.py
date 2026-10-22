@@ -62,7 +62,12 @@ from PyQt6.QtWidgets import (
 
 import storage
 from src import config, model_store
-from src.config import AUTO_STOP_CHOICES, AVAILABLE_MODELS, Settings
+from src.config import (
+    AUTO_STOP_CHOICES,
+    AVAILABLE_MODELS,
+    DEFAULT_AUTO_STOP_SECONDS,
+    Settings,
+)
 from src.core.icons import app_icon, icon
 from src.core.styles import (
     LIVE,
@@ -396,44 +401,34 @@ class MainWindow(QMainWindow):
         self.timecodes_box.setToolTip("Добавлять в текст распознавания")
         box.addWidget(self.timecodes_box)
 
-        # Остановка по тишине: микрофон замолчал — значит, человек
-        # закончил и забыл нажать ■. Число секунд рядом, чтобы срок
-        # можно было менять, не правя код.
-        self.auto_stop_box = QCheckBox("Стоп по тишине")
-        self.auto_stop_box.setChecked(self.settings.auto_stop)
-        self.auto_stop_box.setToolTip(
-            "Останавливать запись, если микрофон замолчал"
-        )
-        box.addWidget(self.auto_stop_box)
+        # АвтоСтоп: микрофон замолчал — значит, человек закончил
+        # и забыл нажать ■. Поле сделано как у микрофона наверху:
+        # значок с подсказкой и раскрывающийся список сроков.
+        box.addWidget(self._icon_label("stop", "АвтоСтоп"))
 
-        self.auto_stop_seconds_box = QComboBox()
-        # Сохранённый срок попадает в список, даже если его там не было:
-        # файл настроек можно править руками, и тогда значение не
-        # должно молча превращаться в другое
-        choices = list(AUTO_STOP_CHOICES)
-        saved = self.settings.auto_stop_seconds
-        if saved not in choices:
-            choices.append(saved)
-        for seconds in choices:
-            self.auto_stop_seconds_box.addItem(f"{seconds} с", seconds)
-        chosen = self.auto_stop_seconds_box.findData(saved)
-        if chosen >= 0:
-            self.auto_stop_seconds_box.setCurrentIndex(chosen)
-        self.auto_stop_seconds_box.setToolTip(
-            "Сколько секунд тишины считать концом записи"
+        self.auto_stop_box = QComboBox()
+        self.auto_stop_box.setMinimumWidth(90)
+        self.auto_stop_box.setToolTip(
+            "АвтоСтоп: остановить запись, если микрофон замолчал.\n"
+            "«нет» — запись идёт, пока не нажмёте ■."
         )
-        self.auto_stop_seconds_box.setEnabled(self.settings.auto_stop)
-        box.addWidget(self.auto_stop_seconds_box)
+        self.auto_stop_box.addItem("нет", None)
+        for seconds in AUTO_STOP_CHOICES:
+            self.auto_stop_box.addItem(f"{seconds} с", seconds)
+
+        saved = self.settings.auto_stop_seconds
+        chosen = 0 if saved is None else self.auto_stop_box.findData(saved)
+        if chosen < 0:
+            chosen = self.auto_stop_box.findData(DEFAULT_AUTO_STOP_SECONDS)
+        self.auto_stop_box.setCurrentIndex(chosen)
+        box.addWidget(self.auto_stop_box)
 
         # Слоты подключаем последними: до этого момента расстановка
         # галочек ещё не должна была ничего записывать в настройки
         self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
         self.auto_copy_box.toggled.connect(self._on_auto_copy)
         self.timecodes_box.toggled.connect(self._on_timecodes)
-        self.auto_stop_box.toggled.connect(self._on_auto_stop)
-        self.auto_stop_seconds_box.currentIndexChanged.connect(
-            self._on_auto_stop_seconds
-        )
+        self.auto_stop_box.currentIndexChanged.connect(self._on_auto_stop)
 
         box.addStretch(1)
         return holder
@@ -1098,17 +1093,14 @@ class MainWindow(QMainWindow):
         self.settings.timecodes = checked
         self.settings.save()
 
-    def _on_auto_stop(self, checked: bool) -> None:
-        self.settings.auto_stop = checked
-        self.settings.save()
-        # Без галочки выбор срока бесполезен — прячем его
-        self.auto_stop_seconds_box.setEnabled(checked)
-
-    def _on_auto_stop_seconds(self) -> None:
-        seconds = self.auto_stop_seconds_box.currentData()
-        if isinstance(seconds, int):
+    def _on_auto_stop(self) -> None:
+        """Выбран новый срок автостопа (или он выключен вовсе)."""
+        seconds = self.auto_stop_box.currentData()
+        if seconds is None:
+            self.settings.auto_stop_seconds = None
+        elif isinstance(seconds, int):
             self.settings.auto_stop_seconds = seconds
-            self.settings.save()
+        self.settings.save()
 
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)
@@ -1808,14 +1800,15 @@ class MainWindow(QMainWindow):
         звука нельзя закрывать из фонового потока, только из того, где
         его открывали. Тикер окна как раз работает в главном потоке.
         """
-        if not self.auto_stop_box.isChecked():
+        limit = self.settings.auto_stop_seconds
+        if limit is None:
+            # Автостоп выключен — запись идёт, пока не нажмут ■
             return
 
         # Пауза — это решение человека, а не молчание микрофона
         if recorder.is_paused:
             return
 
-        limit = float(self.settings.auto_stop_seconds)
         silence = recorder.silence_seconds
 
         if silence < limit - min(AUTO_STOP_WARN, limit / 2):
