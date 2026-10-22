@@ -40,6 +40,12 @@ class SettingsTest(unittest.TestCase):
         # Авто-стоп тоже включён, срок — пять секунд
         self.assertEqual(settings.auto_stop_seconds, config.DEFAULT_AUTO_STOP_SECONDS)
 
+    def test_every_timeout_has_a_name_for_the_list(self) -> None:
+        # Список в окне собирается по AUTO_STOP_CHOICES: срок без
+        # названия уронил бы окно при сборке
+        for seconds in config.AUTO_STOP_CHOICES:
+            self.assertIn(seconds, config.AUTO_STOP_LABELS)
+
     def test_round_trip(self) -> None:
         settings = config.Settings()
         settings.recordings_dir = "C:/записи"
