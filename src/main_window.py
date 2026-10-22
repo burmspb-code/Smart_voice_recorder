@@ -429,6 +429,7 @@ class MainWindow(QMainWindow):
         self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
         self.auto_copy_box.toggled.connect(self._on_auto_copy)
         self.timecodes_box.toggled.connect(self._on_timecodes)
+        self.auto_stop_menu.aboutToShow.connect(self._highlight_auto_stop)
         self.auto_stop_menu.triggered.connect(self._on_auto_stop)
 
         box.addStretch(1)
@@ -1105,6 +1106,18 @@ class MainWindow(QMainWindow):
         current = self.settings.auto_stop_seconds
         for action in self.auto_stop_menu.actions():
             action.setChecked(action.data() == current)
+
+    def _highlight_auto_stop(self) -> None:
+        """Подсвечивает текущий срок при открытии списка.
+
+        Списки микрофона и модели открываются с подсвеченной выбранной
+        строкой — список автостопа должен выглядеть так же.
+        """
+        self._mark_auto_stop()
+        for action in self.auto_stop_menu.actions():
+            if action.isChecked():
+                self.auto_stop_menu.setActiveAction(action)
+                return
 
     def _on_nothing_recorded(self) -> None:
         self._set_recording_ui(False)
