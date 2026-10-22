@@ -16,6 +16,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from src import main_window as mw
@@ -181,6 +182,49 @@ class SeparatorSaveTest(_WindowCase):
         self.assertEqual(
             second.with_suffix(".txt").read_text(encoding="utf-8"), "речь два"
         )
+
+
+class TextScrollTest(_WindowCase):
+    """Свежий кусок текста всегда виден без ручной прокрутки."""
+
+    def _last_block_rect(self):
+        edit = self.window.text_edit
+        block = edit.document().lastBlock()
+        return edit.blockBoundingGeometry(block).translated(edit.contentOffset())
+
+    def test_new_text_scrolls_into_view(self) -> None:
+        self.window.show()
+        self.window._show_zone()
+        QTest.qWait(400)
+
+        for index in range(20):
+            self.append("запись", f"кусок {index} " + "текст " * 12)
+
+        edit = self.window.text_edit
+        bar = edit.verticalScrollBar()
+
+        self.assertGreater(bar.maximum(), 0, "текст не переполнил окно")
+        self.assertEqual(bar.value(), bar.maximum(), "ползунок остался наверху")
+
+        rect = self._last_block_rect()
+        self.assertGreaterEqual(rect.top(), 0)
+        self.assertLessEqual(rect.bottom(), edit.viewport().height() + 1)
+
+    def test_pane_opens_on_the_last_block(self) -> None:
+        # Куски пришли, пока зона была закрыта: прокручивать было некуда
+        for index in range(20):
+            self.append("запись", f"кусок {index} " + "текст " * 12)
+
+        self.window.show()
+        self.window._show_zone()
+        QTest.qWait(400)
+
+        edit = self.window.text_edit
+        bar = edit.verticalScrollBar()
+        self.assertEqual(bar.value(), bar.maximum())
+
+        rect = self._last_block_rect()
+        self.assertLessEqual(rect.bottom(), edit.viewport().height() + 1)
 
 
 if __name__ == "__main__":

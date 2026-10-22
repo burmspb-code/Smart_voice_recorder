@@ -1487,6 +1487,18 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ текст
 
+    def _scroll_to_end(self) -> None:
+        """Прокручивает текст к последнему куску.
+
+        Новый кусок встаёт ниже видимой части, и без прокрутки
+        распознанное остаётся за нижним краем: пользователь видел бы
+        его, только потянув ползунок сам. Курсор при этом не трогаем —
+        иначе правка посреди текста при следующей записи уехала бы
+        в самый конец.
+        """
+        bar = self.text_edit.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def _insert_separator(self, title: str, text: str) -> None:
         """Вставляет кусок текста вместе с разделителем перед ним.
 
@@ -1554,6 +1566,10 @@ class MainWindow(QMainWindow):
         # таймкоды, и пустой полосой без единого символа, если нет
         title = f"── {stamp} · {title} ──" if self.timecodes_box.isChecked() else ""
         self._insert_separator(title, text)
+
+        # Свежий кусок должен быть на виду: он встаёт ниже видимой
+        # части, и без прокрутки его пришлось бы искать ползунком
+        self._scroll_to_end()
 
         self._appending = False
 
@@ -1729,6 +1745,8 @@ class MainWindow(QMainWindow):
             # Зона только что раскрылась: полоса прокрутки таблицы
             # появилась вместе с ней, до этого прокручивать некуда
             self.record_table.scrollToBottom()
+            # Текст тоже открывается на последнем куске, а не на начале
+            self._scroll_to_end()
         else:
             target = self._stationary_height()
 
