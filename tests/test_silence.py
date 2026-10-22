@@ -5,7 +5,7 @@
 
 Железо не трогаем: куски звука подаются прямо в колбэк рекордера,
 ровно так же, как их подаёт PortAudio. Проверяем три вещи — как
-считается тишина, где границы речи и что попадает в файл.
+считается тишина, был ли голос и что попадает в файл.
 """
 
 import tempfile
@@ -92,8 +92,8 @@ class SilenceTest(unittest.TestCase):
         self.assertEqual(self.recorder.silence_seconds, 0.0)
 
 
-class VoiceBoundaryTest(unittest.TestCase):
-    """Границы речи — по ним отрезается тишина по краям файла."""
+class VoiceSeenTest(unittest.TestCase):
+    """Был ли голос в записи: без него файла не будет."""
 
     def setUp(self) -> None:
         self.recorder = Recorder()
@@ -101,34 +101,22 @@ class VoiceBoundaryTest(unittest.TestCase):
     def feed(self, level: float, frames: int = CHUNK) -> None:
         self.recorder._audio_callback(chunk(level, frames), frames, None, None)
 
-    def test_no_voice_yet(self) -> None:
+    def test_quiet_is_not_voice(self) -> None:
         self.feed(QUIET)
 
-        self.assertEqual(self.recorder._voice_start, -1)
+        self.assertFalse(self.recorder._voice_seen)
 
-    def test_start_follows_first_voice(self) -> None:
-        self.feed(QUIET)
+    def test_speech_is_voice(self) -> None:
         self.feed(SPEECH)
 
-        self.assertEqual(self.recorder._voice_start, CHUNK)
-        self.assertEqual(self.recorder._voice_end, 2 * CHUNK)
+        self.assertTrue(self.recorder._voice_seen)
 
-    def test_end_follows_last_voice(self) -> None:
-        self.feed(SPEECH)
+    def test_voice_stays_remembered(self) -> None:
         self.feed(SPEECH)
         self.feed(QUIET)
 
-        self.assertEqual(self.recorder._voice_start, 0)
-        self.assertEqual(self.recorder._voice_end, 2 * CHUNK)
-
-    def test_silence_between_voice_stays_inside(self) -> None:
-        self.feed(SPEECH)
-        self.feed(QUIET)
-        self.feed(SPEECH)
-
-        # Пауза посреди речи не вырезается: только края
-        self.assertEqual(self.recorder._voice_start, 0)
-        self.assertEqual(self.recorder._voice_end, 3 * CHUNK)
+        # Голос был — значит, запись не пустая
+        self.assertTrue(self.recorder._voice_seen)
 
 
 class PauseTest(unittest.TestCase):
@@ -176,7 +164,7 @@ class SavedFileTest(unittest.TestCase):
         with wave.open(str(path), "rb") as wav:
             return wav.getnframes()
 
-    def test_silent_tail_is_cut(self) -> None:
+    def test_silent_tail_is_kept(self) -> None:
         recorder = self._recorder()
         self._feed(recorder, SPEECH)
         self._feed(recorder, SPEECH)
@@ -186,10 +174,11 @@ class SavedFileTest(unittest.TestCase):
 
         recorder._wait_worker()
 
+        # Файл сохраняется целиком: обрезка отрезала часть записи
         self.assertTrue(recorder._path.is_file())
-        self.assertEqual(self._frames_in_file(recorder._path), 2 * CHUNK)
+        self.assertEqual(self._frames_in_file(recorder._path), 4 * CHUNK)
 
-    def test_silent_head_is_cut(self) -> None:
+    def test_silent_head_is_kept(self) -> None:
         recorder = self._recorder()
         self._feed(recorder, QUIET)
         self._feed(recorder, SPEECH)
@@ -197,7 +186,7 @@ class SavedFileTest(unittest.TestCase):
 
         recorder._wait_worker()
 
-        self.assertEqual(self._frames_in_file(recorder._path), CHUNK)
+        self.assertEqual(self._frames_in_file(recorder._path), 2 * CHUNK)
 
     def test_silent_recording_leaves_no_file(self) -> None:
         emptied = []

@@ -395,13 +395,11 @@ class Recorder:
 
         # Слежение за тишиной. _silent_since — с какого момента звук
         # молчит (None — тишины нет, считать нечего).
-        # _voice_start и _voice_end — границы речи в отсчётах: по ним
-        # от готового файла отрезается тишина по краям.
+        # _voice_seen — был ли голос хоть раз: запись без голоса
+        # бесполезна, такой файл не сохраняется.
         self._rms = 0.0
         self._silent_since: float | None = None
-        self._samples = 0
-        self._voice_start = -1
-        self._voice_end = 0
+        self._voice_seen = False
 
         # Счётчик записанного времени: _written хранит закрытые отрезки,
         # _segment_start — начало текущего. На паузе он равен None,
@@ -507,9 +505,7 @@ class Recorder:
         self._peak = 0.0
         self._level = 0.0
         self._rms = 0.0
-        self._samples = 0
-        self._voice_start = -1
-        self._voice_end = 0
+        self._voice_seen = False
         self._reset_silence()
         self._stop.clear()
         self._paused.clear()
@@ -553,7 +549,7 @@ class Recorder:
         self._track_sound(chunk)
 
     def _track_sound(self, chunk: np.ndarray) -> None:
-        """Следит за тишиной и запоминает, где идёт речь.
+        """Следит за тишиной и запоминает, был ли голос.
 
         Молчание считается по среднеквадратичному уровню куска: он
         отвечает на вопрос «есть ли голос», а пик отвечает на вопрос
@@ -561,26 +557,17 @@ class Recorder:
 
         Между порогами мёртвая зона: звук на границе не должен то
         входить в тишину, то из неё выходить.
-
-        _voice_start и _voice_end — границы речи в отсчётах от начала
-        записи. По ним потом отрезается тишина: сначала считает,
-        потом пишет.
         """
         rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32))))) / 32768
         self._rms = rms
-        count = len(chunk)
 
         if rms >= VOICE_LEVEL:
-            # Голос есть: тишина закончилась, границы речи сдвинулись
+            # Голос есть: тишина закончилась
             self._silent_since = None
-            if self._voice_start < 0:
-                self._voice_start = self._samples
-            self._voice_end = self._samples + count
+            self._voice_seen = True
         elif rms < SILENCE_FLOOR and self._silent_since is None:
             # Тишина началась — запоминаем момент, с которого её считать
             self._silent_since = time.monotonic()
-
-        self._samples += count
 
     def _reset_silence(self) -> None:
         """Начинает отсчёт тишины заново.
@@ -678,7 +665,7 @@ class Recorder:
 
         # Голоса не было — файла не будет. Запись из одной тишины
         # бесполезна, а пустые файлы только мешают в списке.
-        if self._voice_start < 0:
+        if not self._voice_seen:
             self._discard()
             if self.on_empty:
                 self.on_empty()
@@ -741,14 +728,13 @@ class Recorder:
         (_flush_pending), поэтому итоговый файл переписывается из
         черновика байт в байт — копить всё в памяти не нужно.
 
-        Тишина по краям в файл не попадает: сначала пропускаем куски
-        до начала речи, потом пишем до её конца.
+        Файл сохраняется целиком, вместе с тишиной по краям: обрезка
+        отрезала часть записи, а лишние секунды тишины и так убирает
+        фильтр речи при распознавании.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
 
         spill = self._spill_path
-        skip = self._voice_start * 2  # int16 — два байта на отсчёт
-        limit = (self._voice_end - self._voice_start) * 2
 
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(CHANNELS)
@@ -756,19 +742,11 @@ class Recorder:
             wav.setframerate(SAMPLE_RATE)
             if spill is not None and spill.is_file():
                 with spill.open("rb") as raw:
-                    # Пропускаем тишину в начале
-                    while skip > 0:
-                        block = raw.read(min(1024 * 1024, skip))
-                        if not block:
-                            break
-                        skip -= len(block)
-                    # Пишем речь, отрезая хвост тишины
-                    while limit > 0:
-                        block = raw.read(min(1024 * 1024, limit))
+                    while True:
+                        block = raw.read(1024 * 1024)
                         if not block:
                             break
                         wav.writeframes(block)
-                        limit -= len(block)
 
         # Черновик сослужил службу — он больше не нужен
         if spill is not None:
@@ -776,11 +754,9 @@ class Recorder:
                 spill.unlink(missing_ok=True)
 
     def _duration(self) -> float:
-        """Сколько секунд в готовом файле — без тишины по краям."""
-        if self._voice_start < 0:
-            return 0.0
-
-        return (self._voice_end - self._voice_start) / SAMPLE_RATE
+        """Сколько секунд записано."""
+        buffered = sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        return self._spilled + buffered
 
     def is_too_quiet(self) -> bool:
         """Заметно тихо — похоже, микрофон не тот или выключен."""
