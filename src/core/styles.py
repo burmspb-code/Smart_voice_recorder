@@ -324,11 +324,12 @@ QMenu {{
 QMenu::item {{
     padding: 6px 26px 6px 30px;
     border-radius: 4px;
+    min-height: 22px;
 }}
 
 QMenu::item:selected {{
-    background-color: {ACTIVE};
-    color: {ACTIVE_TEXT};
+    background-color: {FOCUS};
+    color: {ON_ACCENT};
 }}
 
 /* Отметка выбранного срока: слева от строки, как у галочек */
@@ -393,6 +394,7 @@ QPushButton:disabled {{
 QPushButton#autoStop {{
     color: {ON_ACCENT};
     font-weight: normal;
+    min-height: 20px;
     padding: 6px 26px 6px 10px;
     text-align: left;
 }}
