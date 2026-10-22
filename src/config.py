@@ -106,7 +106,7 @@ def looks_nested(candidate: Path, root: Path) -> bool:
     try:
         resolved = candidate.resolve()
         root_resolved = root.resolve()
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return False
 
     return resolved.is_relative_to(root_resolved) and resolved != root_resolved
@@ -146,7 +146,7 @@ class Settings:
 
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             # Испорченный файл — начинаем с настроек по умолчанию
             return
 
