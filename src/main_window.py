@@ -98,10 +98,10 @@ UI_TICK_MS = 33
 # остановится. Без предупреждения автостоп выглядит как поломка.
 AUTO_STOP_WARN = 2.0
 
-# Значок на клавишах записи. Кнопки по 44 пикселя, и 28 занимают чуть
-# больше половины: прежние 22 терялись на их фоне и читались точкой,
-# а значок вровень с кнопкой давит на неё
-BUTTON_ICON = 28
+# Значок на клавишах записи. Кнопки по 44 пикселя, и 30 — предел:
+# значок с полями 6 px занимает их целиком, а на 32 кнопки уже
+# подрастают до 46
+BUTTON_ICON = 30
 
 # Значок перед полем верхней строки. Поля в оформлении по 34 пикселя,
 # и значок занимает эту высоту целиком; на 36 строка уже подрастает
@@ -551,8 +551,8 @@ class MainWindow(QMainWindow):
         self.zone_button = QPushButton()
         self.zone_button.setMinimumHeight(44)
         self.zone_button.setMinimumWidth(110)
-        self.zone_button.setIcon(icon("open"))
-        self.zone_button.setIconSize(QSize(22, 22))
+        self.zone_button.setIcon(icon("open", BUTTON_ICON))
+        self.zone_button.setIconSize(QSize(BUTTON_ICON, BUTTON_ICON))
         self.zone_button.setCheckable(True)
         self.zone_button.setToolTip(
             "Показать или скрыть список записей и распознанный текст"
