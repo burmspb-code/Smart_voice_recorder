@@ -98,6 +98,11 @@ UI_TICK_MS = 33
 # остановится. Без предупреждения автостоп выглядит как поломка.
 AUTO_STOP_WARN = 2.0
 
+# Значок на клавишах записи. Кнопки по 44 пикселя, и 28 занимают чуть
+# больше половины: прежние 22 терялись на их фоне и читались точкой,
+# а значок вровень с кнопкой давит на неё
+BUTTON_ICON = 28
+
 
 class Signals(QObject):
     """Мост из рабочих потоков в интерфейс.
@@ -514,16 +519,16 @@ class MainWindow(QMainWindow):
         self.record_button = QPushButton()
         self.record_button.setMinimumHeight(44)
         self.record_button.setMinimumWidth(110)
-        self.record_button.setIcon(icon("play"))
-        self.record_button.setIconSize(QSize(22, 22))
+        self.record_button.setIcon(icon("play", BUTTON_ICON))
+        self.record_button.setIconSize(QSize(BUTTON_ICON, BUTTON_ICON))
         self.record_button.setToolTip("Начать запись")
         row.addWidget(self.record_button)
 
         self.stop_button = QPushButton()
         self.stop_button.setMinimumHeight(44)
         self.stop_button.setMinimumWidth(110)
-        self.stop_button.setIcon(icon("stop"))
-        self.stop_button.setIconSize(QSize(22, 22))
+        self.stop_button.setIcon(icon("stop", BUTTON_ICON))
+        self.stop_button.setIconSize(QSize(BUTTON_ICON, BUTTON_ICON))
         self.stop_button.setToolTip("Остановить запись и сохранить файл")
         self.stop_button.setEnabled(False)
         row.addWidget(self.stop_button)
@@ -531,8 +536,8 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton()
         self.cancel_button.setMinimumHeight(44)
         self.cancel_button.setMinimumWidth(110)
-        self.cancel_button.setIcon(icon("cancel"))
-        self.cancel_button.setIconSize(QSize(22, 22))
+        self.cancel_button.setIcon(icon("cancel", BUTTON_ICON))
+        self.cancel_button.setIconSize(QSize(BUTTON_ICON, BUTTON_ICON))
         self.cancel_button.setEnabled(False)
         self.cancel_button.setToolTip("Отменить последнюю запись")
         row.addWidget(self.cancel_button)
@@ -1066,16 +1071,16 @@ class MainWindow(QMainWindow):
         paused = recording and recorder.is_paused
 
         if not recording:
-            self.record_button.setIcon(icon("play"))
+            self.record_button.setIcon(icon("play", BUTTON_ICON))
             self.record_button.setToolTip("Начать запись")
             self.indicator.set_state(IDLE)
         elif paused:
-            self.record_button.setIcon(icon("play"))
+            self.record_button.setIcon(icon("play", BUTTON_ICON))
             self.record_button.setToolTip("Продолжить запись")
             self.indicator.set_state(PAUSED)
             self._say("Пауза — нажмите ту же клавишу, чтобы продолжить")
         else:
-            self.record_button.setIcon(icon("pause"))
+            self.record_button.setIcon(icon("pause", BUTTON_ICON))
             self.record_button.setToolTip("Пауза")
             self.indicator.set_state(RECORDING)
 
