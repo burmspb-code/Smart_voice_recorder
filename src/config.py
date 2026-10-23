@@ -18,6 +18,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 APP_NAME = "SmartVoiceRecorder"
@@ -102,9 +103,47 @@ def models_dir() -> Path:
     return local_app_dir() / "models"
 
 
+def app_dir() -> Path:
+    """Папка, рядом с которой запускалось приложение.
+
+    Для собранного .exe — папка с исполняемым файлом.
+    Для запуска из исходников — папка с главным скриптом (main.py),
+    чтобы при копировании бинарника (или при запуске из другой
+    папки) записи создавались рядом с программой, а не внутри
+    дерева проекта.
+
+    Идём от sys.executable/sys.argv[0], а не от __file__ модуля
+    config: иначе при заморозке PyInstaller __file__ оказывается во
+    временной папке, и записи улетят не туда.
+    """
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        exe = Path(sys.executable).resolve()
+        if exe.parent.name:
+            return exe.parent
+    # Запуск из исходников
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0:
+        script = Path(argv0).resolve()
+        if script.is_file():
+            return script.parent
+        if script.parent.name:
+            return script.parent
+    # Последний шанс — рабочая папка. Редко, но лучше чем падать.
+    return Path.cwd()
+
+
+def project_root() -> Path:
+    """Корень проекта — папка, где лежит pyproject.toml.
+
+    Считается от расположения этого файла, а не от текущей рабочей
+    папки: иначе запуск из другой директории ломает пути.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
 def default_recordings_dir() -> Path:
     """Корень для записей — папка recordings рядом с программой."""
-    return project_root() / "recordings"
+    return app_dir() / "recordings"
 
 
 def looks_nested(candidate: Path, root: Path) -> bool:
@@ -126,20 +165,13 @@ def looks_nested(candidate: Path, root: Path) -> bool:
     return resolved.is_relative_to(root_resolved) and resolved != root_resolved
 
 
-def project_root() -> Path:
-    """Корень проекта — папка, где лежит pyproject.toml.
-
-    Считается от расположения этого файла, а не от текущей рабочей
-    папки: иначе запуск из другой директории ломает пути.
-    """
-    return Path(__file__).resolve().parent.parent
-
 
 class Settings:
     """Настройки приложения. Читаются при старте, пишутся по кнопке «Сохранить»."""
 
     def __init__(self) -> None:
-        self.recordings_dir: str = str(project_root() / "recordings")
+        # Папка по умолчанию — рядом с исполняемым файлом/скриптом
+        self.recordings_dir: str = str(default_recordings_dir())
         self.model: str = DEFAULT_MODEL
         self.microphone: int | None = None  # None — выбрать автоматически
         self.last_block: str = ""
@@ -172,7 +204,29 @@ class Settings:
         if not isinstance(data, dict):
             return
 
-        self.recordings_dir = str(data.get("recordings_dir") or self.recordings_dir)
+        saved = data.get("recordings_dir") or ""
+        if isinstance(saved, str) and saved:
+            # Если корневую папку не переносили вместе с программой,
+            # при копировании .exe в другую папку лучше создать
+            # recordings рядом с исполняемым файлом, а не указывать
+            # на несуществующую папку старого проекта
+            try:
+                saved_path = Path(saved).expanduser().resolve()
+            except (OSError, ValueError):
+                saved_path = None
+            default_recordings_dir().resolve()
+            old_default = project_root().resolve() / "recordings"
+            app_dir_resolved = app_dir().resolve()
+            # Мигрируем только старый путь по умолчанию: если он совпадает
+            # с recordings из папки проекта и мы запущены из другого
+            # места, либо если старый путь больше не существует
+            if (saved_path == old_default and app_dir_resolved != old_default.parent) or (saved_path == old_default and not saved_path.exists()):
+                self.recordings_dir = str(default_recordings_dir())
+            else:
+                self.recordings_dir = str(saved)
+        else:
+            self.recordings_dir = str(default_recordings_dir())
+
         self.model = str(data.get("model") or self.model)
 
         mic = data.get("microphone")
