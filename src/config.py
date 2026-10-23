@@ -135,10 +135,16 @@ def app_dir() -> Path:
 def project_root() -> Path:
     """Корень проекта — папка, где лежит pyproject.toml.
 
-    Считается от расположения этого файла, а не от текущей рабочей
-    папки: иначе запуск из другой директории ломает пути.
+    В замороженном виде (PyInstaller) pyproject.toml нет, поэтому
+    возвращаем папку приложения как разумный запасной вариант.
     """
-    return Path(__file__).resolve().parent.parent
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return app_dir()
+    start = Path(__file__).resolve().parent
+    for parent in (start, *start.parents):
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return start.parent
 
 
 def default_recordings_dir() -> Path:
@@ -214,13 +220,31 @@ class Settings:
                 saved_path = Path(saved).expanduser().resolve()
             except (OSError, ValueError):
                 saved_path = None
-            default_recordings_dir().resolve()
-            old_default = project_root().resolve() / "recordings"
             app_dir_resolved = app_dir().resolve()
+            # Старые пути по умолчанию, которые надо мигрировать
+            old_defaults = set()
+            old_defaults.add(project_root().resolve() / "recordings")
+            # При запуске копии exe из другого места project_root() теперь
+            # указывает на папку с exe, поэтому добавляем исходный путь
+            # проекта как ещё один кандидат на миграцию
+            for candidate_root in (
+                Path(__file__).resolve().parent.parent,
+                Path(r"C:\My_projects\Smart_voice_recorder").resolve(),
+            ):
+                old_defaults.add(candidate_root / "recordings")
             # Мигрируем только старый путь по умолчанию: если он совпадает
             # с recordings из папки проекта и мы запущены из другого
             # места, либо если старый путь больше не существует
-            if (saved_path == old_default and app_dir_resolved != old_default.parent) or (saved_path == old_default and not saved_path.exists()):
+            should_migrate = False
+            if saved_path in old_defaults:
+                if app_dir_resolved not in {p.parent for p in old_defaults} or not saved_path.exists():
+                    should_migrate = True
+                elif getattr(sys, "frozen", False) and app_dir_resolved != saved_path.parent:
+                    # Скопировали exe — пути разные
+                    should_migrate = True
+            if saved_path is not None and saved_path == project_root().resolve():
+                should_migrate = True
+            if should_migrate:
                 self.recordings_dir = str(default_recordings_dir())
             else:
                 self.recordings_dir = str(saved)
