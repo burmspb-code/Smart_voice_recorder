@@ -1972,8 +1972,36 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _set_app_id() -> None:
+    """Сообщает Windows, что окно принадлежит нашему приложению.
+
+    Без этого панель задач группирует окно по процессу: в запуске из
+    исходников там значок Python, а закреплённая кнопка ведёт не туда.
+    Со своим идентификатором Windows берёт значок из окна и запоминает
+    приложение отдельно от python.exe. У собранного .exe с вшитым
+    значком всё работает и так, но одинаковое поведение лучше.
+
+    Вызывать до создания QApplication: идентификатор читается в момент
+    появления первого окна, позже он уже не подействует.
+    """
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "burmspb.SmartVoiceRecorder"
+        )
+    except (AttributeError, OSError):
+        # Старая Windows или урезанная среда — не повод не запускаться
+        pass
+
+
 def run() -> int:
     """Запуск приложения."""
+    _set_app_id()
+
     app = QApplication(sys.argv)
     app.setApplicationName("SmartVoiceRecorder")
     apply_locale(app)
