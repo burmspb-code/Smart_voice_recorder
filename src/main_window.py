@@ -1975,35 +1975,30 @@ class MainWindow(QMainWindow):
         self.settings.save()
 
 def _play_done_sound() -> None:
-    """Короткий автономный сигнал после завершения распознавания.
+    """Короткий сигнал после завершения распознавания.
 
-    Звук лежит в src/assets/done.wav рядом с программой — работает
-    вне зависимости от настроек системы. В собранном exe файл
-    попадает через datas в SmartVoiceRecorder.spec.
+    Файл speech_on.wav лежит в src/assets — автономный, не зависит
+    от настроек звуков Windows. Попадает в сборку через datas.
     """
     from src.core.icons import asset_path
 
     def _run() -> None:
-        path = asset_path("done.wav")
+        path = asset_path("speech_on.wav")
         if not path.is_file():
             return
-        # Пробуем PyQt6 мультимедиа
         with contextlib.suppress(Exception):
             from PyQt6.QtCore import QUrl
             from PyQt6.QtMultimedia import QSoundEffect
 
             effect = QSoundEffect()
             effect.setSource(QUrl.fromLocalFile(str(path)))
-            effect.setVolume(0.6)
+            effect.setVolume(0.7)
             effect.play()
             return
-        # Резерв: winsound.PlaySound с файлом
         with contextlib.suppress(Exception):
             import winsound
 
             winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-
-    threading.Thread(target=_run, daemon=True).start()
 
 
 def _set_app_id() -> None:
