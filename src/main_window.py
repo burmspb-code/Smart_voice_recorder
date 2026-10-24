@@ -1977,28 +1977,22 @@ class MainWindow(QMainWindow):
 def _play_done_sound() -> None:
     """Короткий сигнал после завершения распознавания.
 
-    Файл speech_on.wav лежит в src/assets — автономный, не зависит
-    от настроек звуков Windows. Попадает в сборку через datas.
+    Файл speech_on.wav берётся из src/assets рядом с программой.
+    Автономный, не зависит от настроек звуков Windows.
     """
     from src.core.icons import asset_path
 
-    def _run() -> None:
-        path = asset_path("speech_on.wav")
-        if not path.is_file():
-            return
-        with contextlib.suppress(Exception):
-            from PyQt6.QtCore import QUrl
-            from PyQt6.QtMultimedia import QSoundEffect
+    path = asset_path("speech_on.wav")
+    if not path.is_file():
+        return
 
-            effect = QSoundEffect()
-            effect.setSource(QUrl.fromLocalFile(str(path)))
-            effect.setVolume(0.7)
-            effect.play()
-            return
+    def _run() -> None:
         with contextlib.suppress(Exception):
             import winsound
 
-            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            winsound.PlaySound(str(path), winsound.SND_FILENAME)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _set_app_id() -> None:
