@@ -429,6 +429,11 @@ class MainWindow(QMainWindow):
         self.timecodes_box.setToolTip("Добавлять в текст распознавания")
         box.addWidget(self.timecodes_box)
 
+        self.play_sound_box = QCheckBox("Звук после распознавания")
+        self.play_sound_box.setChecked(getattr(self.settings, "play_sound", True))
+        self.play_sound_box.setToolTip("Короткий сигнал по окончании расшифровки")
+        box.addWidget(self.play_sound_box)
+
         # АвтоСтоп: микрофон замолчал — значит, человек закончил
         # и забыл нажать ■. Слово написано в самом поле, а сроки
         # раскрываются по нажатию: поэтому это кнопка с меню, а не
@@ -455,6 +460,7 @@ class MainWindow(QMainWindow):
         self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
         self.auto_copy_box.toggled.connect(self._on_auto_copy)
         self.timecodes_box.toggled.connect(self._on_timecodes)
+        self.play_sound_box.toggled.connect(self._on_play_sound)
         self.auto_stop_menu.aboutToShow.connect(self._highlight_auto_stop)
         self.auto_stop_menu.triggered.connect(self._on_auto_stop)
 
@@ -1121,6 +1127,10 @@ class MainWindow(QMainWindow):
         self.settings.timecodes = checked
         self.settings.save()
 
+    def _on_play_sound(self, checked: bool) -> None:
+        self.settings.play_sound = bool(checked)
+        self.settings.save()
+
     def _on_auto_stop(self, action: QAction) -> None:
         """Выбран новый срок автостопа (или он выключен вовсе)."""
         self.settings.auto_stop_seconds = action.data()
@@ -1485,7 +1495,7 @@ class MainWindow(QMainWindow):
                 suffix += f", скопировано в буфер: {self._copied_chars} символов"
             self._say(f"Распознано файлов: {done}{suffix}", SUCCESS)
             self._copied_chars = 0
-            if done > 0:
+            if done > 0 and getattr(self.settings, "play_sound", True):
                 _play_done_sound()
 
     # ------------------------------------------------------------------ текст
@@ -1977,7 +1987,17 @@ def _play_done_sound() -> None:
 
     Файл speech_on.wav берётся из src/assets рядом с программой.
     Автономный, не зависит от настроек звуков Windows.
+    Учитывает настройку «Звук после распознавания».
     """
+    try:
+        from src.config import Settings
+
+        settings = Settings()
+        if not getattr(settings, "play_sound", True):
+            return
+    except Exception:
+        pass
+
     from src.core.icons import asset_path
 
     path = asset_path("speech_on.wav")

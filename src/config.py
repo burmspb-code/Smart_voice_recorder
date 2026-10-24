@@ -188,6 +188,7 @@ class Settings:
         self.auto_transcribe: bool = True
         self.auto_copy: bool = True
         self.timecodes: bool = True
+        self.play_sound: bool = True
         # Авто-стоп: срок тишины, после которого запись останавливается
         # сама. None — автостоп выключен. Молчание микрофона и пауза
         # самого человека — разные вещи, поэтому выключить автостоп
@@ -261,8 +262,7 @@ class Settings:
         self.auto_transcribe = bool(data.get("auto_transcribe", True))
         self.auto_copy = bool(data.get("auto_copy", True))
         self.timecodes = bool(data.get("timecodes", True))
-
-        self.auto_stop_seconds = self._read_auto_stop(data)
+        self.play_sound = bool(data.get("play_sound", True))
 
     def _read_auto_stop(self, data: dict) -> int | None:
         """Срок автостопа из настроек. None — автостоп выключен.
@@ -299,6 +299,7 @@ class Settings:
             "auto_transcribe": self.auto_transcribe,
             "auto_copy": self.auto_copy,
             "timecodes": self.timecodes,
+            "play_sound": self.play_sound,
             "auto_stop_seconds": self.auto_stop_seconds,
         }
         path.write_text(
