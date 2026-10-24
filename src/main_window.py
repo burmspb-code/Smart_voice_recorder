@@ -15,10 +15,12 @@
 центре, записи и выезжающая панель с текстом снизу.
 """
 
+import contextlib
 import os
 import sys
 import threading
 import time
+import winsound
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1484,6 +1486,10 @@ class MainWindow(QMainWindow):
                 suffix += f", скопировано в буфер: {self._copied_chars} символов"
             self._say(f"Распознано файлов: {done}{suffix}", SUCCESS)
             self._copied_chars = 0
+            if done > 0:
+                _play_done_sound()
+                if self.settings.auto_copy:
+                    QApplication.beep()  # короткий сигнал, системный, не навязчивый
 
     # ------------------------------------------------------------------ текст
 
@@ -1969,7 +1975,20 @@ class MainWindow(QMainWindow):
         self.settings.model = self.model_box.currentData()
         self.settings.save()
 
-        event.accept()
+def _play_done_sound() -> None:
+    """Короткий тихий сигнал после завершения распознавания.
+
+    Делаем в отдельном потоке — QTimer/winsound в главном потоке
+    не блокирует, но если вдруг система медленная, лучше не держать
+    обработчики. winsound.MessageBeep играет системный звук без
+    запуска mpv/плеера и работает даже без динамиков настроенных.
+    """
+    def _run() -> None:
+        # MB_OK = 0x00000000 — тихий информационный звук, не навязчивый
+        with contextlib.suppress(Exception):
+            winsound.MessageBeep(0x00000000)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _set_app_id() -> None:
