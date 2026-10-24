@@ -1487,8 +1487,6 @@ class MainWindow(QMainWindow):
             self._copied_chars = 0
             if done > 0:
                 _play_done_sound()
-                if self.settings.auto_copy:
-                    QApplication.beep()  # короткий сигнал, системный, не навязчивый
 
     # ------------------------------------------------------------------ текст
 
