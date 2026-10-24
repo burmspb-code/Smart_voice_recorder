@@ -76,6 +76,11 @@ def _trim(image: QImage) -> QImage:
     return image.copy(QRect(left, top, right - left, bottom - top))
 
 
+def asset_path(name: str) -> Path:
+    """Путь к файлу в src/assets с учётом заморозки PyInstaller."""
+    return ASSETS / name
+
+
 def app_icon() -> QIcon:
     """Иконка приложения из файла. Пустая, если файла нет."""
     return QIcon(str(ICON_PATH)) if ICON_PATH.is_file() else QIcon()

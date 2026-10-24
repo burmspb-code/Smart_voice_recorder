@@ -20,7 +20,6 @@ import os
 import sys
 import threading
 import time
-import winsound
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1976,17 +1975,33 @@ class MainWindow(QMainWindow):
         self.settings.save()
 
 def _play_done_sound() -> None:
-    """Короткий тихий сигнал после завершения распознавания.
+    """Короткий автономный сигнал после завершения распознавания.
 
-    Делаем в отдельном потоке — QTimer/winsound в главном потоке
-    не блокирует, но если вдруг система медленная, лучше не держать
-    обработчики. winsound.MessageBeep играет системный звук без
-    запуска mpv/плеера и работает даже без динамиков настроенных.
+    Звук лежит в src/assets/done.wav рядом с программой — работает
+    вне зависимости от настроек системы. В собранном exe файл
+    попадает через datas в SmartVoiceRecorder.spec.
     """
+    from src.core.icons import asset_path
+
     def _run() -> None:
-        # MB_OK = 0x00000000 — тихий информационный звук, не навязчивый
+        path = asset_path("done.wav")
+        if not path.is_file():
+            return
+        # Пробуем PyQt6 мультимедиа
         with contextlib.suppress(Exception):
-            winsound.MessageBeep(0x00000000)
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtMultimedia import QSoundEffect
+
+            effect = QSoundEffect()
+            effect.setSource(QUrl.fromLocalFile(str(path)))
+            effect.setVolume(0.6)
+            effect.play()
+            return
+        # Резерв: winsound.PlaySound с файлом
+        with contextlib.suppress(Exception):
+            import winsound
+
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
 
     threading.Thread(target=_run, daemon=True).start()
 
