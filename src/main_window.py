@@ -183,6 +183,12 @@ class MainWindow(QMainWindow):
     """Окно приложения."""
 
     def __init__(self) -> None:
+        """Создаёт главное окно: настройки, запись, модель, интерфейс.
+
+        Окно не ждёт конца записи и распознавания — они идут в
+        отдельных потоках, а сюда приходят только сообщения о
+        изменении. Интерфейс не замирает даже при долгом распознавании.
+        """
         super().__init__()
 
         # Иконка ставится здесь, а не в run(): окно может быть создано
@@ -245,6 +251,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- сборка
 
     def _build_ui(self) -> None:
+        """Собирает всё окно сверху вниз: строка настроек, кнопки,
+        индикатор, список записей и текст, строка состояния внизу.
+
+        Пружина держит содержимое сверху, чтобы во время анимации зоны
+        ничего не съезжало.
+        """
         self.setWindowTitle("Голосовые заметки")
         self.resize(920, 680)  # Чуть расширим для удобства
 
@@ -836,6 +848,7 @@ class MainWindow(QMainWindow):
         self._say(f"Микрофонов готово: {len(devices)}{suffix}")
 
     def _fill_models(self) -> None:
+        """Выбирает в списке модель, которая сейчас в настройках."""
         position = self.model_box.findData(self.settings.model)
         if position >= 0:
             self.model_box.setCurrentIndex(position)
@@ -1013,6 +1026,7 @@ class MainWindow(QMainWindow):
 
     @property
     def recorder(self) -> Recorder:
+        """Рекордер текущего окна, если он уже создан."""
         return getattr(self, "_recorder", None)
 
     def _toggle_record(self) -> None:
@@ -1064,6 +1078,7 @@ class MainWindow(QMainWindow):
         self._say("Сохраняю запись…", BUSY)
 
     def _cancel_record(self) -> None:
+        """Отменяет текущую запись, файл не сохраняется."""
         self._ensure_recorder().cancel()
         self._set_recording_ui(False)
 
@@ -1099,6 +1114,12 @@ class MainWindow(QMainWindow):
             self.indicator.set_state(RECORDING)
 
     def _on_recorded(self, path: str, duration: float, peak: float) -> None:
+        """Запись закончилась: обновляет список и сообщает о результате.
+
+        Если шла запись по автостопу или звук почти не записан —
+        говорит об этом в строке состояния. При включённом
+        автораспознавании тут же начинает расшифровку.
+        """
         self._set_recording_ui(False)
         self._refresh_list()
 
@@ -1116,18 +1137,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------- автоматическая расшифровка
 
     def _on_auto_transcribe(self, checked: bool) -> None:
+        """Запоминает настройку «Распознавать после остановки»."""
         self.settings.auto_transcribe = checked
         self.settings.save()
 
     def _on_auto_copy(self, checked: bool) -> None:
+        """Запоминает настройку «Копировать в буфер»."""
         self.settings.auto_copy = checked
         self.settings.save()
 
     def _on_timecodes(self, checked: bool) -> None:
+        """Запоминает настройку «Таймкоды»."""
         self.settings.timecodes = checked
         self.settings.save()
 
     def _on_play_sound(self, checked: bool) -> None:
+        """Запоминает настройку «Звук после распознавания»."""
         self.settings.play_sound = bool(checked)
         self.settings.save()
 
@@ -1156,6 +1181,7 @@ class MainWindow(QMainWindow):
                 return
 
     def _on_nothing_recorded(self) -> None:
+        """Микрофон молчал — запись отменена, файл не создан."""
         self._set_recording_ui(False)
         self._say("Отсутствуют входные данные, запись отменена", WARNING)
 
@@ -1166,6 +1192,7 @@ class MainWindow(QMainWindow):
         self._update_transcribe_button()
 
     def _on_cancelled(self) -> None:
+        """Запись отменена пользователем, файл не сохраняется."""
         self._set_recording_ui(False)
         self._say("Запись отменена, файл не сохранён", WARNING)
 
@@ -1384,6 +1411,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_model_ready(self) -> None:
+        """Модель загружена: останавливает таймер прогресса и сообщает,
+        что можно работать офлайн. После первой загрузки показывает
+        отдельное окно с размером модели.
+        """
         if self._model_progress_timer is not None:
             self._model_progress_timer.stop()
         name = self.settings.model
@@ -1406,6 +1437,7 @@ class MainWindow(QMainWindow):
         self._update_transcribe_button()
 
     def _on_model_failed(self, error: str) -> None:
+        """Модель не загрузилась: ошибка в строке состояния."""
         if self._model_progress_timer is not None:
             self._model_progress_timer.stop()
         self._model_loading = False
@@ -1461,16 +1493,21 @@ class MainWindow(QMainWindow):
         self.transcribe_button.setToolTip(caption)
 
     def _pulse_stop(self) -> None:
+        """Останавливает переливание кнопки «Распознать»."""
         self.transcribe_button.stop_pulse()
         self.transcribe_button.setToolTip(
             "Расшифровать последнюю запись без готового текста"
         )
 
     def _on_file_started(self, wav: str) -> None:
+        """Один файл начал распознаваться: включает пульсацию кнопки."""
         self._pulse_start(f"Распознаю {Path(wav).name}…")
         self._say(f"Распознаю {Path(wav).name}, это займёт время", BUSY)
 
     def _on_file_done(self, wav: str, lines: int, text: str) -> None:
+        """Один файл расшифрован: добавляет текст в окно и обновляет список.
+        Если речи не нашлось — предупреждение, иначе успех.
+        """
         self._append_text(Path(wav), text)
         self._refresh_list()
 
@@ -1480,6 +1517,9 @@ class MainWindow(QMainWindow):
             self._say(f"{Path(wav).name}: готово, строк {lines}", SUCCESS)
 
     def _on_all_done(self, done: int, total: int, stopped: bool) -> None:
+        """Всё распознавание закончилось: убирает пульсацию, пишет итог в
+        строку состояния и, если нужно, издаёт звук завершения.
+        """
         self._pulse_stop()
         self._update_transcribe_button()
         if stopped:
@@ -1608,6 +1648,9 @@ class MainWindow(QMainWindow):
         self._update_dirty()
 
     def _update_dirty(self) -> None:
+        """Показывает или скрывает метку «есть несохранённые правки» и
+        доступность кнопки «Сохранить».
+        """
         self.dirty_label.setVisible(self.dirty)
         self.save_button.setEnabled(self.dirty)
 
@@ -1780,11 +1823,13 @@ class MainWindow(QMainWindow):
             self._hide_zone()
 
     def _show_zone(self) -> None:
+        """Раскрывает вторую зону: список записей и текст распознавания."""
         self.zone_button.setChecked(True)
         self.zone_button.setToolTip("Скрыть записи и текст распознавания")
         self._move_zone(self._zone_height())
 
     def _hide_zone(self) -> None:
+        """Сворачивает вторую зону, остаётся только панель записи."""
         self.zone_button.setChecked(False)
         self.zone_button.setToolTip("Записи и текст распознавания")
         self._move_zone(0)
