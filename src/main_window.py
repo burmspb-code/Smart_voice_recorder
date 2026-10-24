@@ -271,11 +271,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_level())
         layout.addWidget(self._build_details_zone())
 
-        # Пружина держит содержимое сверху, а строку состояния внизу.
-        # Без неё лишняя высота достаётся строкам выше зоны, и пока
-        # окно догоняет анимацию, всё содержимое съезжает вниз
-        layout.addStretch(1)
-
         self.status = QLabel("Готово")
         # Свойство kind задаёт цвет по смыслу и перебивает приглушённый
         # текст, поэтому muted здесь не нужен
