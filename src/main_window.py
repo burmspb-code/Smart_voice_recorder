@@ -267,7 +267,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_top_row())
-        layout.addWidget(self._build_auto_row())
         layout.addLayout(self._build_control_row())
         layout.addWidget(self._build_level())
         layout.addWidget(self._build_details_zone())
@@ -409,75 +408,82 @@ class MainWindow(QMainWindow):
 
         return row
 
-    def _build_auto_row(self) -> QWidget:
-        """Переключатели автоматической расшифровки.
+    def _build_settings_button(self) -> QPushButton:
+        """Кнопка «Настройки» с выпадающим списком переключателей.
 
-        С ними обычный сценарий короткий: записал, нажал ■, текст
-        сам расшифровался и лёг в буфер обмена — вставлять можно
-        сразу, не открывая нижнюю зону.
+        В меню: 4 галочки (распознавание после остановки, копирование
+        в буфер, таймкоды, звук после распознавания) и выпадающий
+        список Автостопа. Перенесены с главного экрана, чтобы он не
+        был перегружен.
         """
-        holder = QWidget()
-        box = QHBoxLayout(holder)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(6)
+        button = QPushButton("Настройки")
+        button.setMinimumHeight(44)
+        button.setMinimumWidth(110)
+        button.setToolTip(
+            "Настройки записи и распознавания:\n"
+            "автораспознавание, буфер, таймкоды, звук, автостоп"
+        )
+        button.setMenu(self._build_settings_menu())
+        return button
 
-        # Галочки ставятся до подключения слотов: иначе начальная
-        # расстановка сохранилась бы в файл настроек и затёрла бы
-        # значения, которые там уже лежат
-        self.auto_transcribe_box = QCheckBox("Распознавать после остановки")
-        self.auto_transcribe_box.setChecked(self.settings.auto_transcribe)
-        self.auto_transcribe_box.setToolTip(
+    def _build_settings_menu(self) -> QMenu:
+        """Выпадающее меню настроек: 4 галочки и автостоп."""
+        menu = QMenu(self)
+
+        # --- галочки ---
+        self.action_auto_transcribe = menu.addAction(
+            "Распознавать после остановки"
+        )
+        self.action_auto_transcribe.setCheckable(True)
+        self.action_auto_transcribe.setChecked(self.settings.auto_transcribe)
+        self.action_auto_transcribe.setToolTip(
             "Автораспознавание после нажатия клавиши Stop"
         )
-        box.addWidget(self.auto_transcribe_box)
+        self.action_auto_transcribe.toggled.connect(self._on_auto_transcribe)
 
-        self.auto_copy_box = QCheckBox("Копировать в буфер")
-        self.auto_copy_box.setChecked(self.settings.auto_copy)
-        self.auto_copy_box.setToolTip("Скопировать текст последней записи")
-        box.addWidget(self.auto_copy_box)
+        self.action_auto_copy = menu.addAction("Копировать в буфер")
+        self.action_auto_copy.setCheckable(True)
+        self.action_auto_copy.setChecked(self.settings.auto_copy)
+        self.action_auto_copy.setToolTip("Скопировать текст последней записи")
+        self.action_auto_copy.toggled.connect(self._on_auto_copy)
 
-        self.timecodes_box = QCheckBox("Таймкоды")
-        self.timecodes_box.setChecked(self.settings.timecodes)
-        self.timecodes_box.setToolTip("Добавлять в текст распознавания")
-        box.addWidget(self.timecodes_box)
+        self.action_timecodes = menu.addAction("Таймкоды")
+        self.action_timecodes.setCheckable(True)
+        self.action_timecodes.setChecked(self.settings.timecodes)
+        self.action_timecodes.setToolTip("Добавлять в текст распознавания")
+        self.action_timecodes.toggled.connect(self._on_timecodes)
 
-        self.play_sound_box = QCheckBox("Звук после распознавания")
-        self.play_sound_box.setChecked(getattr(self.settings, "play_sound", True))
-        self.play_sound_box.setToolTip("Короткий сигнал по окончании расшифровки")
-        box.addWidget(self.play_sound_box)
+        self.action_play_sound = menu.addAction("Звук после распознавания")
+        self.action_play_sound.setCheckable(True)
+        self.action_play_sound.setChecked(getattr(self.settings, "play_sound", True))
+        self.action_play_sound.setToolTip("Короткий сигнал по окончании расшифровки")
+        self.action_play_sound.toggled.connect(self._on_play_sound)
 
-        # АвтоСтоп: микрофон замолчал — значит, человек закончил
-        # и забыл нажать ■. Слово написано в самом поле, а сроки
-        # раскрываются по нажатию: поэтому это кнопка с меню, а не
-        # поле выбора со значком рядом.
-        self.auto_stop_button = QPushButton("АвтоСтоп")
-        self.auto_stop_button.setObjectName("autoStop")
-        self.auto_stop_button.setToolTip(
+        menu.addSeparator()
+
+        # --- автостоп ---
+        self.auto_stop_menu = QMenu("Автостоп", self)
+        self.auto_stop_menu.setToolTip(
             "Остановить запись, если микрофон замолчал.\n"
             "«нет» — запись идёт, пока не нажмёте ■."
         )
+        self.action_auto_stop_none = self.auto_stop_menu.addAction("нет")
+        self.action_auto_stop_none.setCheckable(True)
+        self.action_auto_stop_none.setData(None)
+        self.action_auto_stop_none.setChecked(self.settings.auto_stop_seconds is None)
 
-        self.auto_stop_menu = QMenu(self)
-        for seconds in (None, *AUTO_STOP_CHOICES):
-            title = "нет" if seconds is None else AUTO_STOP_LABELS[seconds]
-            action = self.auto_stop_menu.addAction(title)
+        for seconds in AUTO_STOP_CHOICES:
+            action = self.auto_stop_menu.addAction(AUTO_STOP_LABELS[seconds])
             action.setCheckable(True)
             action.setData(seconds)
-        self.auto_stop_button.setMenu(self.auto_stop_menu)
-        self._mark_auto_stop()
-        box.addWidget(self.auto_stop_button)
+            action.setChecked(self.settings.auto_stop_seconds == seconds)
 
-        # Слоты подключаем последними: до этого момента расстановка
-        # галочек ещё не должна была ничего записывать в настройки
-        self.auto_transcribe_box.toggled.connect(self._on_auto_transcribe)
-        self.auto_copy_box.toggled.connect(self._on_auto_copy)
-        self.timecodes_box.toggled.connect(self._on_timecodes)
-        self.play_sound_box.toggled.connect(self._on_play_sound)
         self.auto_stop_menu.aboutToShow.connect(self._highlight_auto_stop)
         self.auto_stop_menu.triggered.connect(self._on_auto_stop)
 
-        box.addStretch(1)
-        return holder
+        menu.addMenu(self.auto_stop_menu)
+
+        return menu
 
     @staticmethod
     def _icon_label(name: str, tip: str) -> QLabel:
@@ -580,6 +586,9 @@ class MainWindow(QMainWindow):
             "Показать или скрыть список записей и распознанный текст"
         )
         row.addWidget(self.zone_button)
+
+        self.settings_button = self._build_settings_button()
+        row.addWidget(self.settings_button)
 
         return row
 
@@ -1131,7 +1140,7 @@ class MainWindow(QMainWindow):
             message += "  — звук почти не записан"
         self._say(message, SUCCESS)
 
-        if self.auto_transcribe_box.isChecked():
+        if self.settings.auto_transcribe:
             self._transcribe()
 
     # ------------------------------------------------- автоматическая расшифровка
@@ -1476,7 +1485,7 @@ class MainWindow(QMainWindow):
                 done, total, stopped
             ),
             on_error=lambda err: self.signals.transcribe_failed.emit(str(err)),
-            timecodes=self.timecodes_box.isChecked(),
+            timecodes=self.settings.timecodes,
         )
 
         if started:
@@ -1617,7 +1626,7 @@ class MainWindow(QMainWindow):
 
         # Разделитель всегда с меткой: с заголовком, если включены
         # таймкоды, и пустой полосой без единого символа, если нет
-        title = f"── {stamp} · {title} ──" if self.timecodes_box.isChecked() else ""
+        title = f"── {stamp} · {title} ──" if self.settings.timecodes else ""
         self._insert_separator(title, text)
 
         # Свежий кусок должен быть на виду: он встаёт ниже видимой
@@ -1636,7 +1645,7 @@ class MainWindow(QMainWindow):
         # уехала бы вся история разговора вместе с разделителями.
         # Пустой текст тоже не кладём: стёртое содержимое буфера
         # было бы не вернуть.
-        if self.auto_copy_box.isChecked() and text.strip():
+        if self.settings.auto_copy and text.strip():
             QApplication.clipboard().setText(text.strip())
             self._copied_chars = len(text.strip())
 
