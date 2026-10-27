@@ -313,14 +313,14 @@ class ModelStore:
         self._lock = threading.Lock()
         self._loading = False
         self._model = None
-
-    @property
-    def is_loading(self) -> bool:
-        return self._loading
-
-    @property
-    def is_ready(self) -> bool:
-        return self._model is not None
+        # Имя загруженной модели: get() по другому имени пересоздаёт её,
+        # иначе смена в списке молча игнорировалась бы
+        self._model_name: str | None = None
+        # Какая модель грузится в фоне и сигнал о конце загрузки:
+        # get() ждёт его, чтобы не создавать вторую копию поверх первой
+        self._loading_name: str | None = None
+        self._load_done = threading.Event()
+        self._load_done.set()
 
     def load_async(
         self,
@@ -330,15 +330,20 @@ class ModelStore:
     ) -> None:
         """Начинает загрузку модели, не блокируя вызывающий поток.
 
-        Повторный вызов, когда модель уже грузится или загружена,
-        ничего не делает — второй экземпляр не создаётся.
+        Повторный вызов для той же модели, когда она уже загружена
+        или грузится, ничего не делает — второй экземпляр не создаётся.
         """
-        if self._model is not None or self._loading:
-            if self._model is not None and on_done:
+        if self._model is not None and self._model_name == name:
+            if on_done:
                 on_done(self._model)
             return
 
+        if self._loading:
+            return
+
         self._loading = True
+        self._loading_name = name
+        self._load_done.clear()
         thread = threading.Thread(
             target=self._load_worker,
             args=(name, on_done, on_error),
@@ -357,6 +362,8 @@ class ModelStore:
             model = _create(name)
         except Exception as error:  # noqa: BLE001 - причина уходит в строку статуса
             self._loading = False
+            self._loading_name = None
+            self._load_done.set()
             if on_error:
                 on_error(error)
             return
@@ -365,25 +372,32 @@ class ModelStore:
         # начатое в момент загрузки, могло бы создать вторую модель
         with self._lock:
             self._model = model
+            self._model_name = name
         self._loading = False
+        self._loading_name = None
+        self._load_done.set()
         if on_done:
             on_done(model)
 
     def get(self, name: str) -> object:
         """Отдаёт готовую модель, создавая её при необходимости.
 
+        Если эта же модель ещё грузится в фоне, вызов ждёт её: вторая
+        копия заняла бы столько же памяти и полезла бы скачивать то же
+        самое. Если загружена модель другого размера, она заменяется —
+        иначе выбранная в списке модель не применялась бы до перезапуска.
+
         Вызывать только из того же потока, который её уже загрузил:
         это блокирующий вызов для распознавания.
         """
-        with self._lock:
-            if self._model is None:
-                self._model = _create(name)
-            return self._model
+        if self._loading and self._loading_name == name:
+            self._load_done.wait()
 
-    def unload(self) -> None:
-        """Отпускает модель. Нужна, если пользователь сменил размер."""
         with self._lock:
-            self._model = None
+            if self._model is None or self._model_name != name:
+                self._model = _create(name)
+                self._model_name = name
+            return self._model
 
 
 def _create(name: str) -> object:

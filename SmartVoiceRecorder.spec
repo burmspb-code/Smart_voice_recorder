@@ -8,6 +8,9 @@
 #   onnxruntime. Без неё распознавание падает на vad_filter=True
 #   с NO_SUCHFILE. PyInstaller такие файлы не подхватывает сам.
 # * src/assets — иконки интерфейса, читаются из папки пакета.
+# * src/assets/icon.ico — значок самого .exe. Без него PyInstaller
+#   вшивает свой, поэтому в Проводнике и на панели задач был чужой
+#   значок. Пересобрать из icon.png: python make_icon.py
 #
 # Модель распознавания (1,5 ГБ) сюда НЕ входит: её приложение
 # скачивает само при первом запуске.
@@ -43,6 +46,7 @@ exe = EXE(
     a.datas,
     [],
     name='SmartVoiceRecorder',
+    icon='src/assets/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

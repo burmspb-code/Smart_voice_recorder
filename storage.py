@@ -25,6 +25,20 @@ NO_BLOCK = "без названия"
 # Символы, которые Windows не пускает в имя файла
 INVALID_CHARS = '<>:"/\\|?*'
 
+# Имена, зарезервированные Windows: папку с таким именем создать нельзя,
+# даже с расширением. Проверяются без учёта регистра и без хвоста после точки.
+RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+# Длительность, прочитанная из заголовка файла: путь -> (mtime, размер, сек).
+# Заголовок wav читается открытием файла, а scan() зовётся на каждое
+# обновление таблицы и на каждую букву в названии блока. Без кэша это
+# сотни открытий файлов там, где содержимое не менялось.
+_DURATION_CACHE: dict[Path, tuple[float, int, float]] = {}
+
 
 def format_duration(seconds: float, pad: bool = False) -> str:
     """Длительность в виде минут и секунд: 0:07, 12:34.
@@ -39,6 +53,33 @@ def format_duration(seconds: float, pad: bool = False) -> str:
     return f"{minutes}:{total % 60:02d}"
 
 
+def _duration_from_file(wav: Path) -> float:
+    """Читает длительность из заголовка wav. Ошибка — ноль секунд."""
+    try:
+        with wave.open(str(wav), "rb") as handle:
+            rate = handle.getframerate()
+            if not rate:
+                return 0.0
+            return handle.getnframes() / rate
+    except (OSError, wave.Error, EOFError):
+        return 0.0
+
+
+def _cached_duration(wav: Path, modified: float, size: int) -> float:
+    """Длительность с кэшем по времени изменения и размеру файла.
+
+    Ключ — путь, а признак свежести — mtime и размер: перезаписанный
+    файл с тем же именем перечитается, а неизменившийся не откроется.
+    """
+    known = _DURATION_CACHE.get(wav)
+    if known is not None and known[0] == modified and known[1] == size:
+        return known[2]
+
+    duration = _duration_from_file(wav)
+    _DURATION_CACHE[wav] = (modified, size, duration)
+    return duration
+
+
 def read_duration(wav: Path) -> float:
     """Длительность записи в секундах, из заголовка wav.
 
@@ -47,19 +88,22 @@ def read_duration(wav: Path) -> float:
     а не ошибку — список записей должен собираться всегда.
     """
     try:
-        with wave.open(str(wav), "rb") as handle:
-            rate = handle.getframerate()
-            if not rate:
-                return 0.0
-            return handle.getnframes() / rate
-    except OSError, wave.Error, EOFError:
+        stat = wav.stat()
+    except OSError:
         return 0.0
+    return _cached_duration(wav, stat.st_mtime, stat.st_size)
 
 
 def sanitize(name: str) -> str:
     """Готовит название блока к тому, чтобы стать именем папки."""
     cleaned = "".join("_" if ch in INVALID_CHARS else ch for ch in name.strip())
-    return cleaned.strip(". ")[:60]
+    cleaned = cleaned.strip(". ")[:60]
+
+    # «CON», «NUL», «COM1» и подобные Windows не даёт использовать
+    # как имя папки: подчёркивание в начале делает имя обычным
+    if cleaned.upper() in RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 @dataclass
@@ -106,12 +150,6 @@ class Recording:
         """
         return self.block or NO_BLOCK
 
-    @property
-    def title(self) -> str:
-        """Строка для списка в интерфейсе."""
-        when = self.created.strftime("%d.%m.%Y %H:%M") if self.created else "—"
-        return f"{when}  ·  {self.block or NO_BLOCK}"
-
 
 def block_dir(root: Path, block: str) -> Path:
     """Папка блока. Записи без названия складываются отдельно."""
@@ -144,8 +182,10 @@ def unique_path(root: Path, block: str) -> Path:
     folder = block_dir(root, block)
     folder.mkdir(parents=True, exist_ok=True)
 
+    # Время берётся одно на все попытки: иначе за время перебора
+    # успевала смениться секунда и суффикс с номером не появлялся
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     for n in range(1, 100):
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         name = f"{stamp}.wav" if n == 1 else f"{stamp}_{n}.wav"
         if not (folder / name).exists():
             return folder / name
@@ -160,11 +200,15 @@ def block_of(root: Path, wav: Path) -> str:
     return wav.parent.name
 
 
-def scan(root: Path) -> list[Recording]:
+def scan(root: Path, folder: str | None = None) -> list[Recording]:
     """Все записи, от свежих к старым.
 
     Порядок по времени изменения файла: он надёжнее имени,
     если файл переименовали или перенесли.
+
+    folder — папка блока (для записей без названия это NO_BLOCK).
+    Фильтр применяется до чтения заголовков: таблица показывает один
+    блок, и открывать wav из всех остальных незачем.
     """
     if not root.is_dir():
         return []
@@ -176,14 +220,18 @@ def scan(root: Path) -> list[Recording]:
         except OSError:
             continue
 
+        block = block_of(root, wav)
+        if folder is not None and (block or NO_BLOCK) != folder:
+            continue
+
         found.append(
             Recording(
                 wav=wav,
-                block=block_of(root, wav),
+                block=block,
                 created=parse_when(wav.stem),
                 has_text=wav.with_suffix(".txt").exists(),
                 size_mb=stat.st_size / 1024 / 1024,
-                duration=read_duration(wav),
+                duration=_cached_duration(wav, stat.st_mtime, stat.st_size),
                 modified=stat.st_mtime,
             )
         )
@@ -200,10 +248,7 @@ def pending(root: Path, block: str | None = None) -> list[Recording]:
     нужно для случая, когда распознавание ограничено одним блоком,
     а таблица показывает только его.
     """
-    found = scan(root)
-    if block is not None:
-        found = [r for r in found if r.block_folder == block]
-    return [r for r in found if not r.has_text]
+    return [r for r in scan(root, folder=block) if not r.has_text]
 
 
 def blocks(root: Path) -> list[str]:

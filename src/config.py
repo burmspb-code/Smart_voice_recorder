@@ -18,6 +18,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 APP_NAME = "SmartVoiceRecorder"
@@ -102,9 +103,53 @@ def models_dir() -> Path:
     return local_app_dir() / "models"
 
 
+def app_dir() -> Path:
+    """Папка, рядом с которой запускалось приложение.
+
+    Для собранного .exe — папка с исполняемым файлом.
+    Для запуска из исходников — папка с главным скриптом (main.py),
+    чтобы при копировании бинарника (или при запуске из другой
+    папки) записи создавались рядом с программой, а не внутри
+    дерева проекта.
+
+    Идём от sys.executable/sys.argv[0], а не от __file__ модуля
+    config: иначе при заморозке PyInstaller __file__ оказывается во
+    временной папке, и записи улетят не туда.
+    """
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        exe = Path(sys.executable).resolve()
+        if exe.parent.name:
+            return exe.parent
+    # Запуск из исходников
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0:
+        script = Path(argv0).resolve()
+        if script.is_file():
+            return script.parent
+        if script.parent.name:
+            return script.parent
+    # Последний шанс — рабочая папка. Редко, но лучше чем падать.
+    return Path.cwd()
+
+
+def project_root() -> Path:
+    """Корень проекта — папка, где лежит pyproject.toml.
+
+    В замороженном виде (PyInstaller) pyproject.toml нет, поэтому
+    возвращаем папку приложения как разумный запасной вариант.
+    """
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return app_dir()
+    start = Path(__file__).resolve().parent
+    for parent in (start, *start.parents):
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return start.parent
+
+
 def default_recordings_dir() -> Path:
     """Корень для записей — папка recordings рядом с программой."""
-    return project_root() / "recordings"
+    return app_dir() / "recordings"
 
 
 def looks_nested(candidate: Path, root: Path) -> bool:
@@ -126,20 +171,13 @@ def looks_nested(candidate: Path, root: Path) -> bool:
     return resolved.is_relative_to(root_resolved) and resolved != root_resolved
 
 
-def project_root() -> Path:
-    """Корень проекта — папка, где лежит pyproject.toml.
-
-    Считается от расположения этого файла, а не от текущей рабочей
-    папки: иначе запуск из другой директории ломает пути.
-    """
-    return Path(__file__).resolve().parent.parent
-
 
 class Settings:
     """Настройки приложения. Читаются при старте, пишутся по кнопке «Сохранить»."""
 
     def __init__(self) -> None:
-        self.recordings_dir: str = str(project_root() / "recordings")
+        # Папка по умолчанию — рядом с исполняемым файлом/скриптом
+        self.recordings_dir: str = str(default_recordings_dir())
         self.model: str = DEFAULT_MODEL
         self.microphone: int | None = None  # None — выбрать автоматически
         self.last_block: str = ""
@@ -150,6 +188,7 @@ class Settings:
         self.auto_transcribe: bool = True
         self.auto_copy: bool = True
         self.timecodes: bool = True
+        self.play_sound: bool = True
         # Авто-стоп: срок тишины, после которого запись останавливается
         # сама. None — автостоп выключен. Молчание микрофона и пауза
         # самого человека — разные вещи, поэтому выключить автостоп
@@ -172,7 +211,44 @@ class Settings:
         if not isinstance(data, dict):
             return
 
-        self.recordings_dir = str(data.get("recordings_dir") or self.recordings_dir)
+        saved = data.get("recordings_dir") or ""
+        if isinstance(saved, str) and saved:
+            # Если корневую папку не переносили вместе с программой,
+            # при копировании .exe в другую папку лучше создать
+            # recordings рядом с исполняемым файлом, а не указывать
+            # на несуществующую папку старого проекта
+            try:
+                saved_path = Path(saved).expanduser().resolve()
+            except (OSError, ValueError):
+                saved_path = None
+            app_dir_resolved = app_dir().resolve()
+            # Старые пути по умолчанию, которые надо мигрировать
+            old_defaults = {
+                project_root().resolve() / "recordings",
+                # При запуске копии exe из другого места project_root()
+                # теперь указывает на папку с exe, поэтому исходный путь
+                # проекта добавляем отдельным кандидатом
+                Path(__file__).resolve().parent.parent / "recordings",
+            }
+            # Мигрируем только старый путь по умолчанию: если он совпадает
+            # с recordings из папки проекта и мы запущены из другого
+            # места, либо если старый путь больше не существует
+            should_migrate = False
+            if saved_path in old_defaults:
+                if app_dir_resolved not in {p.parent for p in old_defaults} or not saved_path.exists():
+                    should_migrate = True
+                elif getattr(sys, "frozen", False) and app_dir_resolved != saved_path.parent:
+                    # Скопировали exe — пути разные
+                    should_migrate = True
+            if saved_path is not None and saved_path == project_root().resolve():
+                should_migrate = True
+            if should_migrate:
+                self.recordings_dir = str(default_recordings_dir())
+            else:
+                self.recordings_dir = str(saved)
+        else:
+            self.recordings_dir = str(default_recordings_dir())
+
         self.model = str(data.get("model") or self.model)
 
         mic = data.get("microphone")
@@ -183,7 +259,9 @@ class Settings:
         self.auto_transcribe = bool(data.get("auto_transcribe", True))
         self.auto_copy = bool(data.get("auto_copy", True))
         self.timecodes = bool(data.get("timecodes", True))
-
+        self.play_sound = bool(data.get("play_sound", True))
+        # Срок автостопа читается через _read_auto_stop: там разбор
+        # старого формата и проверка значения по списку
         self.auto_stop_seconds = self._read_auto_stop(data)
 
     def _read_auto_stop(self, data: dict) -> int | None:
@@ -221,6 +299,7 @@ class Settings:
             "auto_transcribe": self.auto_transcribe,
             "auto_copy": self.auto_copy,
             "timecodes": self.timecodes,
+            "play_sound": self.play_sound,
             "auto_stop_seconds": self.auto_stop_seconds,
         }
         path.write_text(
@@ -232,6 +311,3 @@ class Settings:
         path = Path(self.recordings_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def model_label(self) -> str:
-        return AVAILABLE_MODELS.get(self.model, self.model)

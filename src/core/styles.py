@@ -588,7 +588,7 @@ QCheckBox::indicator:disabled {{
 }}"""
 
 
-def apply_property(widget: QWidget, name: str, value: bool) -> None:
+def apply_property(widget: QWidget, name: str, value: object) -> None:
     """Меняет свойство виджета и заставляет Qt перерисовать его.
 
     Без unpolish/polish Qt не перечитает таблицу стилей,

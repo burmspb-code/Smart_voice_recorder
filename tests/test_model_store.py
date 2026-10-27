@@ -4,9 +4,13 @@
 """Тесты model_store: подсчёт скачанного для прогресса загрузки."""
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from src import model_store
 from src.model_store import _blob_bytes
 
 
@@ -55,3 +59,47 @@ class BlobBytesTest(unittest.TestCase):
         (self.root / "blobs").mkdir(parents=True)
 
         self.assertEqual(_blob_bytes(self.root), 0)
+
+
+class GetModelTest(unittest.TestCase):
+    def test_get_waits_for_background_load(self) -> None:
+        """get() не создаёт вторую копию, пока первая ещё грузится."""
+        store = model_store.ModelStore()
+        created: list[str] = []
+        started = threading.Event()
+
+        def fake_create(name: str) -> str:
+            created.append(name)
+            started.set()
+            time.sleep(0.2)
+            return f"model:{name}"
+
+        with mock.patch.object(model_store, "_create", fake_create):
+            store.load_async("medium")
+            self.assertTrue(started.wait(timeout=5))
+            model = store.get("medium")
+
+        self.assertEqual(model, "model:medium")
+        self.assertEqual(created, ["medium"], "модель создана дважды")
+
+    def test_get_replaces_model_of_another_size(self) -> None:
+        """Смена модели в списке не игнорируется молча."""
+        store = model_store.ModelStore()
+
+        with mock.patch.object(model_store, "_create", lambda name: f"model:{name}"):
+            self.assertEqual(store.get("tiny"), "model:tiny")
+            self.assertEqual(store.get("small"), "model:small")
+
+    def test_get_reuses_already_loaded_model(self) -> None:
+        store = model_store.ModelStore()
+        created: list[str] = []
+
+        def fake_create(name: str) -> str:
+            created.append(name)
+            return f"model:{name}"
+
+        with mock.patch.object(model_store, "_create", fake_create):
+            store.get("base")
+            store.get("base")
+
+        self.assertEqual(created, ["base"])

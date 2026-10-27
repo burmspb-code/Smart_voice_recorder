@@ -17,16 +17,15 @@ from pathlib import Path
 import numpy as np
 
 from src.recorder import (
-    SILENCE_FLOOR,
     VOICE_LEVEL,
     Recorder,
 )
 
-# Уровни для проверок. Молчание — ниже порога, голос — заметно выше,
-# пограничный — между порогами, там, где решает мёртвая зона.
-QUIET = SILENCE_FLOOR / 2
+# Уровни для проверок. Молчание — заметно ниже порога, голос — заметно
+# выше, пограничный — ниже порога, но выше фона в комнате.
+QUIET = VOICE_LEVEL / 4
 SPEECH = VOICE_LEVEL * 4
-BORDERLINE = (SILENCE_FLOOR + VOICE_LEVEL) / 2
+BORDERLINE = VOICE_LEVEL * 0.7
 
 CHUNK = 1024
 
@@ -73,11 +72,22 @@ class SilenceTest(unittest.TestCase):
 
         self.assertGreater(self.recorder.silence_seconds, 0.0)
 
-    def test_borderline_level_does_not_start_silence(self) -> None:
+    def test_borderline_level_starts_silence(self) -> None:
+        # Звук ниже порога голоса — уже тишина, даже если он громче
+        # фона. Иначе отсчёт не начинался бы после фразы.
         self.feed(SPEECH)
         self.feed(BORDERLINE)
 
-        self.assertEqual(self.recorder.silence_seconds, 0.0)
+        self.assertGreater(self.recorder.silence_seconds, 0.0)
+
+    def test_room_noise_after_speech_starts_the_clock(self) -> None:
+        # Фон 0.004 после усиления даёт 0.0052. Раньше он попадал
+        # между порогами, отсчёт не запускался, и автостоп после
+        # сказанной фразы не срабатывал вовсе.
+        self.feed(SPEECH)
+        self.feed(0.004)
+
+        self.assertGreater(self.recorder.silence_seconds, 0.0)
 
     def test_loud_sound_ends_silence(self) -> None:
         self.feed(QUIET)
@@ -117,6 +127,15 @@ class VoiceSeenTest(unittest.TestCase):
 
         # Голос был — значит, запись не пустая
         self.assertTrue(self.recorder._voice_seen)
+
+    def test_voice_seen_property_is_public(self) -> None:
+        # Окну нужен этот признак: пока голоса не было, автостоп
+        # не останавливает запись
+        self.feed(QUIET)
+        self.assertFalse(self.recorder.voice_seen)
+
+        self.feed(SPEECH)
+        self.assertTrue(self.recorder.voice_seen)
 
 
 class PauseTest(unittest.TestCase):

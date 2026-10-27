@@ -44,6 +44,16 @@ class SanitizeTest(unittest.TestCase):
     def test_empty_name_stays_empty(self) -> None:
         self.assertEqual(storage.sanitize("   "), "")
 
+    def test_reserved_windows_names_get_a_prefix(self) -> None:
+        # Папку с такими именами Windows не создаёт, даже с расширением
+        for reserved in ("CON", "nul", "COM1", "lpt9"):
+            with self.subTest(name=reserved):
+                self.assertEqual(storage.sanitize(reserved), f"_{reserved}")
+
+    def test_ordinary_names_stay_as_they_are(self) -> None:
+        self.assertEqual(storage.sanitize("идея"), "идея")
+        self.assertEqual(storage.sanitize("console"), "console")
+
 
 class BlockDirTest(unittest.TestCase):
     def test_block_name_is_sanitized(self) -> None:
@@ -140,3 +150,21 @@ class ScanTest(unittest.TestCase):
             make_wav(folder / "a.wav", 1.0)
 
         self.assertEqual(sorted(storage.blocks(self.root)), ["дом", "идея"])
+
+    def test_scan_can_limit_to_one_block(self) -> None:
+        for block in ("идея", "дом"):
+            folder = self.root / block
+            folder.mkdir(parents=True, exist_ok=True)
+            make_wav(folder / "a.wav", 1.0)
+
+        found = storage.scan(self.root, folder="идея")
+
+        self.assertEqual([r.block for r in found], ["идея"])
+
+    def test_scan_of_unnamed_block_uses_the_folder_name(self) -> None:
+        folder = self.root / storage.NO_BLOCK
+        folder.mkdir(parents=True, exist_ok=True)
+        make_wav(folder / "a.wav", 1.0)
+
+        self.assertEqual(len(storage.scan(self.root, folder=storage.NO_BLOCK)), 1)
+        self.assertEqual(storage.scan(self.root, folder="идея"), [])
