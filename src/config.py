@@ -223,16 +223,13 @@ class Settings:
                 saved_path = None
             app_dir_resolved = app_dir().resolve()
             # Старые пути по умолчанию, которые надо мигрировать
-            old_defaults = set()
-            old_defaults.add(project_root().resolve() / "recordings")
-            # При запуске копии exe из другого места project_root() теперь
-            # указывает на папку с exe, поэтому добавляем исходный путь
-            # проекта как ещё один кандидат на миграцию
-            for candidate_root in (
-                Path(__file__).resolve().parent.parent,
-                Path(r"C:\My_projects\Smart_voice_recorder").resolve(),
-            ):
-                old_defaults.add(candidate_root / "recordings")
+            old_defaults = {
+                project_root().resolve() / "recordings",
+                # При запуске копии exe из другого места project_root()
+                # теперь указывает на папку с exe, поэтому исходный путь
+                # проекта добавляем отдельным кандидатом
+                Path(__file__).resolve().parent.parent / "recordings",
+            }
             # Мигрируем только старый путь по умолчанию: если он совпадает
             # с recordings из папки проекта и мы запущены из другого
             # места, либо если старый путь больше не существует
@@ -263,6 +260,9 @@ class Settings:
         self.auto_copy = bool(data.get("auto_copy", True))
         self.timecodes = bool(data.get("timecodes", True))
         self.play_sound = bool(data.get("play_sound", True))
+        # Срок автостопа читается через _read_auto_stop: там разбор
+        # старого формата и проверка значения по списку
+        self.auto_stop_seconds = self._read_auto_stop(data)
 
     def _read_auto_stop(self, data: dict) -> int | None:
         """Срок автостопа из настроек. None — автостоп выключен.
@@ -311,6 +311,3 @@ class Settings:
         path = Path(self.recordings_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def model_label(self) -> str:
-        return AVAILABLE_MODELS.get(self.model, self.model)

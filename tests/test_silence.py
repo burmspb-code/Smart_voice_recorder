@@ -118,6 +118,15 @@ class VoiceSeenTest(unittest.TestCase):
         # Голос был — значит, запись не пустая
         self.assertTrue(self.recorder._voice_seen)
 
+    def test_voice_seen_property_is_public(self) -> None:
+        # Окну нужен этот признак: пока голоса не было, автостоп
+        # не останавливает запись
+        self.feed(QUIET)
+        self.assertFalse(self.recorder.voice_seen)
+
+        self.feed(SPEECH)
+        self.assertTrue(self.recorder.voice_seen)
+
 
 class PauseTest(unittest.TestCase):
     """Пауза — это не молчание микрофона."""

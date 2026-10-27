@@ -57,7 +57,9 @@ class _WindowCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.window = mw.MainWindow()
         self.window.recordings = self.root
-        self.window.auto_copy_box.setChecked(False)
+        # Переключатели живут в меню «Настройки», а не отдельными
+        # галочками: дёргаем те же действия, что и человек
+        self.window.action_auto_copy.setChecked(False)
 
     def tearDown(self) -> None:
         # Закрытие несохранённого окна открывает модальный диалог,
@@ -87,7 +89,7 @@ class SeparatorTextTest(_WindowCase):
         self.assertEqual(len(self.window._separator_blocks()), 2)
 
     def test_no_characters_without_timecodes(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         self.append("первая", "речь один")
         self.append("вторая", "речь два")
@@ -101,7 +103,7 @@ class SeparatorTextTest(_WindowCase):
         self.assertEqual(text.strip(), "речь один\n\n\nречь два")
 
     def test_title_visible_with_timecodes(self) -> None:
-        self.window.timecodes_box.setChecked(True)
+        self.window.action_timecodes.setChecked(True)
 
         self.append("первая", "речь один")
 
@@ -111,7 +113,7 @@ class SeparatorTextTest(_WindowCase):
         for timecodes in (True, False):
             with self.subTest(timecodes=timecodes):
                 self.window.text_edit.clear()
-                self.window.timecodes_box.setChecked(timecodes)
+                self.window.action_timecodes.setChecked(timecodes)
 
                 self.append("запись", "речь")
 
@@ -125,19 +127,34 @@ class SeparatorTextTest(_WindowCase):
                 )
 
     def test_marker_never_leaks_into_text(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         self.append("первая", "речь один")
 
         copied = self.window.text_edit.toPlainText()
         self.assertNotIn(mw.SEPARATOR_MARK, copied)
 
+    def test_copy_has_only_speech(self) -> None:
+        """В буфер не попадает заголовок разделителя, даже с таймкодами."""
+        self.window.action_timecodes.setChecked(True)
+
+        self.append("первая", "речь один")
+        self.append("вторая", "речь два")
+
+        self.window._copy_text()
+
+        copied = QApplication.clipboard().text()
+        self.assertIn("речь один", copied)
+        self.assertIn("речь два", copied)
+        self.assertNotIn("──", copied)
+        self.assertNotIn(" · ", copied)
+
 
 class SeparatorSaveTest(_WindowCase):
     """Правки из окна раскладываются по файлам по меткам разделителей."""
 
     def test_saves_each_block_to_its_own_file(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         first = self.append("первая", "речь один")
         second = self.append("вторая", "речь два")
@@ -159,8 +176,28 @@ class SeparatorSaveTest(_WindowCase):
             "речь два дополнено",
         )
 
+    def test_new_text_does_not_discard_unsaved_edits(self) -> None:
+        """Новая расшифровка не делает вид, что старые правки сохранены."""
+        self.window.action_timecodes.setChecked(False)
+
+        self.append("первая", "речь один")
+
+        cursor = self.window.text_edit.textCursor()
+        cursor.movePosition(mw.QTextCursor.MoveOperation.End)
+        cursor.insertText(" правка")
+        self.assertTrue(self.window.dirty)
+
+        # Пришёл новый кусок распознавания — правка всё ещё не сохранена
+        self.append("вторая", "речь два")
+
+        self.assertTrue(
+            self.window.dirty,
+            "новая расшифровка сбросила флаг несохранённых правок",
+        )
+        self.assertTrue(self.window.save_button.isEnabled())
+
     def test_lost_markers_warn_instead_of_glueing(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         first = self.append("первая", "речь один")
         second = self.append("вторая", "речь два")

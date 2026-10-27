@@ -415,6 +415,10 @@ class Recorder:
         self._thread: threading.Thread | None = None
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
+        # Буфер трогают два потока: PortAudio дописывает, сохраняльщик
+        # забирает. Без замка пачка, добавленная ровно в момент обмена,
+        # могла попасть в уже отсоединённый список и потеряться.
+        self._frames_lock = threading.Lock()
         # Черновой файл и то, сколько секунд в него уже сброшено
         self._spill_path: Path | None = None
         self._spilled = 0.0
@@ -486,6 +490,16 @@ class Recorder:
 
         return time.monotonic() - since
 
+    @property
+    def voice_seen(self) -> bool:
+        """Был ли в записи голос хоть раз.
+
+        Пока False, автостоп ждёт: останавливать запись, в которой
+        человек ещё не сказал ни слова, значит отменять её, пока он
+        думает.
+        """
+        return self._voice_seen
+
     def pause(self) -> None:
         """Останавливает таймер и запись, не закрывая файл."""
         # Пауза обрывает тишину: человек не молчал, он отошёл
@@ -547,6 +561,13 @@ class Recorder:
         self._written = 0.0
         self._segment_start = self._started_at
 
+        # Черновик от прошлого запуска, оставшийся после падения, нельзя
+        # дописывать: unique_path проверяет только .wav, и в него попал
+        # бы чужой звук
+        if self._spill_path is not None:
+            with suppress(OSError):
+                self._spill_path.unlink(missing_ok=True)
+
         self._stream = sd.InputStream(
             device=device,
             channels=CHANNELS,
@@ -572,7 +593,8 @@ class Recorder:
         # Дальше идёт уже усиленный звук: индикатор уровня, автостоп
         # и сохранённый файл должны показывать одно и то же
         chunk = _amplify(mono)
-        self._frames.append(chunk)
+        with self._frames_lock:
+            self._frames.append(chunk)
 
         # int16 максимум 32767 — приводим к шкале 0..1
         level = float(np.abs(chunk).max()) / 32768
@@ -610,6 +632,11 @@ class Recorder:
         Вызывается при начале записи и при продолжении после паузы:
         после паузы человек начинает говорить заново, и тишину надо
         считать с этого момента.
+
+        Отсчёт идёт и до первой фразы, но решение об автостопе
+        принимает окно: пока voice_seen == False, запись не
+        останавливается (см. _check_auto_stop), иначе автобстоп
+        срабатывал бы, пока человек ещё собирается с мыслями.
         """
         self._silent_since = time.monotonic()
 
@@ -728,11 +755,13 @@ class Recorder:
         оттуда напрямую.
         """
         if not force:
-            buffered = sum(len(chunk) for chunk in self._frames)
+            with self._frames_lock:
+                buffered = sum(len(chunk) for chunk in self._frames)
             if buffered < SPILL_FRAMES:
                 return
 
-        pending, self._frames = self._frames, []
+        with self._frames_lock:
+            pending, self._frames = self._frames, []
         if not pending:
             return
 
@@ -748,7 +777,8 @@ class Recorder:
 
     def _discard(self) -> None:
         """Выбрасывает накопленное: память и черновой файл."""
-        self._frames = []
+        with self._frames_lock:
+            self._frames = []
         self._spilled = 0.0
 
         spill = self._spill_path
@@ -790,9 +820,6 @@ class Recorder:
 
     def _duration(self) -> float:
         """Сколько секунд записано."""
-        buffered = sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
+        with self._frames_lock:
+            buffered = sum(len(chunk) for chunk in self._frames) / SAMPLE_RATE
         return self._spilled + buffered
-
-    def is_too_quiet(self) -> bool:
-        """Заметно тихо — похоже, микрофон не тот или выключен."""
-        return self._peak < SILENCE_WARNING
