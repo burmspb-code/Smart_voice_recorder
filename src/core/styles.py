@@ -70,6 +70,9 @@ PRIMARY = "#ff3b30"
 PRIMARY_HOVER = "#ff453a"
 PRIMARY_PRESSED = "#d72f26"
 
+# Работа идёт: запись, распознавание, загрузка модели
+BUSY = "#ffd44a"
+
 # Предупреждение о несохранённых правках
 WARNING = "#e0a13a"
 
@@ -152,6 +155,10 @@ QLabel[kind="info"] {{
 
 QLabel[kind="success"] {{
     color: {LIVE};
+}}
+
+QLabel[kind="busy"] {{
+    color: {BUSY};
 }}
 
 QLabel[kind="warning"] {{
@@ -581,7 +588,7 @@ QCheckBox::indicator:disabled {{
 }}"""
 
 
-def apply_property(widget: QWidget, name: str, value: bool) -> None:
+def apply_property(widget: QWidget, name: str, value: object) -> None:
     """Меняет свойство виджета и заставляет Qt перерисовать его.
 
     Без unpolish/polish Qt не перечитает таблицу стилей,

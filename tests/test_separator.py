@@ -16,6 +16,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from src import main_window as mw
@@ -56,7 +57,9 @@ class _WindowCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.window = mw.MainWindow()
         self.window.recordings = self.root
-        self.window.auto_copy_box.setChecked(False)
+        # Переключатели живут в меню «Настройки», а не отдельными
+        # галочками: дёргаем те же действия, что и человек
+        self.window.action_auto_copy.setChecked(False)
 
     def tearDown(self) -> None:
         # Закрытие несохранённого окна открывает модальный диалог,
@@ -86,7 +89,7 @@ class SeparatorTextTest(_WindowCase):
         self.assertEqual(len(self.window._separator_blocks()), 2)
 
     def test_no_characters_without_timecodes(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         self.append("первая", "речь один")
         self.append("вторая", "речь два")
@@ -95,11 +98,12 @@ class SeparatorTextTest(_WindowCase):
 
         self.assertNotIn("─", text)
         self.assertNotIn(mw.SEPARATOR_MARK, text)
-        # Между кусками остаётся пустая строка — и только она
-        self.assertEqual(text.strip(), "речь один\n\nречь два")
+        # Между кусками — пустая строка и полоса под ней: полоса
+        # занимает ещё одну строку, но ни одного своего символа
+        self.assertEqual(text.strip(), "речь один\n\n\nречь два")
 
     def test_title_visible_with_timecodes(self) -> None:
-        self.window.timecodes_box.setChecked(True)
+        self.window.action_timecodes.setChecked(True)
 
         self.append("первая", "речь один")
 
@@ -109,7 +113,7 @@ class SeparatorTextTest(_WindowCase):
         for timecodes in (True, False):
             with self.subTest(timecodes=timecodes):
                 self.window.text_edit.clear()
-                self.window.timecodes_box.setChecked(timecodes)
+                self.window.action_timecodes.setChecked(timecodes)
 
                 self.append("запись", "речь")
 
@@ -123,19 +127,34 @@ class SeparatorTextTest(_WindowCase):
                 )
 
     def test_marker_never_leaks_into_text(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         self.append("первая", "речь один")
 
         copied = self.window.text_edit.toPlainText()
         self.assertNotIn(mw.SEPARATOR_MARK, copied)
 
+    def test_copy_has_only_speech(self) -> None:
+        """В буфер не попадает заголовок разделителя, даже с таймкодами."""
+        self.window.action_timecodes.setChecked(True)
+
+        self.append("первая", "речь один")
+        self.append("вторая", "речь два")
+
+        self.window._copy_text()
+
+        copied = QApplication.clipboard().text()
+        self.assertIn("речь один", copied)
+        self.assertIn("речь два", copied)
+        self.assertNotIn("──", copied)
+        self.assertNotIn(" · ", copied)
+
 
 class SeparatorSaveTest(_WindowCase):
     """Правки из окна раскладываются по файлам по меткам разделителей."""
 
     def test_saves_each_block_to_its_own_file(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         first = self.append("первая", "речь один")
         second = self.append("вторая", "речь два")
@@ -157,8 +176,28 @@ class SeparatorSaveTest(_WindowCase):
             "речь два дополнено",
         )
 
+    def test_new_text_does_not_discard_unsaved_edits(self) -> None:
+        """Новая расшифровка не делает вид, что старые правки сохранены."""
+        self.window.action_timecodes.setChecked(False)
+
+        self.append("первая", "речь один")
+
+        cursor = self.window.text_edit.textCursor()
+        cursor.movePosition(mw.QTextCursor.MoveOperation.End)
+        cursor.insertText(" правка")
+        self.assertTrue(self.window.dirty)
+
+        # Пришёл новый кусок распознавания — правка всё ещё не сохранена
+        self.append("вторая", "речь два")
+
+        self.assertTrue(
+            self.window.dirty,
+            "новая расшифровка сбросила флаг несохранённых правок",
+        )
+        self.assertTrue(self.window.save_button.isEnabled())
+
     def test_lost_markers_warn_instead_of_glueing(self) -> None:
-        self.window.timecodes_box.setChecked(False)
+        self.window.action_timecodes.setChecked(False)
 
         first = self.append("первая", "речь один")
         second = self.append("вторая", "речь два")
@@ -180,6 +219,49 @@ class SeparatorSaveTest(_WindowCase):
         self.assertEqual(
             second.with_suffix(".txt").read_text(encoding="utf-8"), "речь два"
         )
+
+
+class TextScrollTest(_WindowCase):
+    """Свежий кусок текста всегда виден без ручной прокрутки."""
+
+    def _last_block_rect(self):
+        edit = self.window.text_edit
+        block = edit.document().lastBlock()
+        return edit.blockBoundingGeometry(block).translated(edit.contentOffset())
+
+    def test_new_text_scrolls_into_view(self) -> None:
+        self.window.show()
+        self.window._show_zone()
+        QTest.qWait(400)
+
+        for index in range(20):
+            self.append("запись", f"кусок {index} " + "текст " * 12)
+
+        edit = self.window.text_edit
+        bar = edit.verticalScrollBar()
+
+        self.assertGreater(bar.maximum(), 0, "текст не переполнил окно")
+        self.assertEqual(bar.value(), bar.maximum(), "ползунок остался наверху")
+
+        rect = self._last_block_rect()
+        self.assertGreaterEqual(rect.top(), 0)
+        self.assertLessEqual(rect.bottom(), edit.viewport().height() + 1)
+
+    def test_pane_opens_on_the_last_block(self) -> None:
+        # Куски пришли, пока зона была закрыта: прокручивать было некуда
+        for index in range(20):
+            self.append("запись", f"кусок {index} " + "текст " * 12)
+
+        self.window.show()
+        self.window._show_zone()
+        QTest.qWait(400)
+
+        edit = self.window.text_edit
+        bar = edit.verticalScrollBar()
+        self.assertEqual(bar.value(), bar.maximum())
+
+        rect = self._last_block_rect()
+        self.assertLessEqual(rect.bottom(), edit.viewport().height() + 1)
 
 
 if __name__ == "__main__":

@@ -187,6 +187,29 @@ class PhysicalMicrophoneTest(unittest.TestCase):
         self.assertEqual(_distinctive("Realtek High Definition Audio"), {"realtek"})
         self.assertEqual(_distinctive("Microphone Array AMD Audio Device"), {"amd"})
 
+    def test_russian_names_do_not_merge_microphones(self) -> None:
+        """Русское «Микрофон» есть в любом имени, опознавать по нему нельзя.
+
+        Windows с русским языком называет все устройства «Микрофон
+        (…)», поэтому без русских слов-пустышек оба микрофона
+        находились как один и тот же.
+        """
+        physical = {
+            "{k20}": "Микрофон HK 1080P K20Pro",
+            "{rtk}": "Микрофон Realtek(R) Audio",
+        }
+
+        self.assertEqual(_distinctive("Микрофон Realtek(R) Audio"), {"realtek"})
+        self.assertEqual(
+            _distinctive("Микрофон HK 1080P K20Pro"), {"1080p", "k20pro"}
+        )
+        self.assertEqual(
+            _match_endpoint("Микрофон (HK 1080P K20Pro)", physical), "{k20}"
+        )
+        self.assertEqual(
+            _match_endpoint("Микрофон (Realtek(R) Audio)", physical), "{rtk}"
+        )
+
     def test_match_endpoint_finds_physical_device(self) -> None:
         self.assertEqual(
             _match_endpoint("Microphone (HK 1080P K20Pro)", self.PHYSICAL),
