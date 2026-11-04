@@ -311,11 +311,20 @@ def candidate_devices() -> list[tuple[int, str]]:
     return result
 
 
-def _delivers_audio(device: int, seconds: float = 0.3) -> bool:
-    """Открывает устройство ненадолго и ждёт хоть один блок звука.
+def _delivers_audio(device: int, seconds: float = 1.5, attempts: int = 3) -> bool:
+    """Открывает устройство и ждёт хоть один блок звука.
 
     Вызывать только из главного потока: WASAPI из фонового потока
     не открывается, PortAudio возвращает ошибку -9999.
+
+    Bluetooth-гарнитуры могут «спать» и нуждаться во времени на
+    просыпание, поэтому делается несколько попыток с паузой между
+    ними. Также берётся частота устройства из системы — Bluetooth
+    гарнитуры часто не поддерживают 48 000 Гц (например, 16 000 Гц
+    по профилю Hands-Free), и с жесткой 48 000 поток не открывается.
+
+    Если звук поступил хотя бы на одной попытке — устройство
+    считается рабочим.
 
     Нужно, чтобы выкинуть из списка устройства, которые открываются,
     но ничего не передают: устаревшие WDM-KS микрофоны и отключённые
@@ -326,19 +335,34 @@ def _delivers_audio(device: int, seconds: float = 0.3) -> bool:
     def callback(indata, frames_count, time_info, status):
         received.append(indata)
 
+    # Частота по умолчанию устройства: Bluetooth часто не поддерживает 48 кГц
     try:
-        with sd.InputStream(
-            device=device,
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
-            dtype=DTYPE,
-            callback=callback,
-        ):
-            deadline = time.monotonic() + seconds
-            while time.monotonic() < deadline and not received:
-                time.sleep(0.02)
-    except Exception:  # noqa: BLE001 - сбой железа равносилен «не проверилось»
-        return False
+        device_info = sd.query_devices(device)
+        sample_rate = int(device_info.get("default_samplerate", SAMPLE_RATE))
+    except Exception:  # noqa: BLE001 - не удалось узнать частоту
+        sample_rate = SAMPLE_RATE
+
+    for attempt in range(attempts):
+        try:
+            with sd.InputStream(
+                device=device,
+                channels=CHANNELS,
+                samplerate=sample_rate,
+                dtype=DTYPE,
+                callback=callback,
+            ):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline and not received:
+                    time.sleep(0.02)
+        except Exception:  # noqa: BLE001 - сбой железа равносилен «не проверилось»
+            pass
+
+        if received:
+            return True
+
+        # Пауза между попытками — Bluetooth гарнитура просыпается
+        if attempt < attempts - 1:
+            time.sleep(0.5)
 
     return bool(received)
 
@@ -425,6 +449,7 @@ class Recorder:
         self._paused = threading.Event()
         self._cancelled = threading.Event()
         self._started_at = 0.0
+        self._sample_rate = SAMPLE_RATE
 
         # Слежение за тишиной. _silent_since — с какого момента звук
         # молчит (None — тишины нет, считать нечего).
@@ -547,10 +572,19 @@ class Recorder:
         self._written = 0.0
         self._segment_start = self._started_at
 
+        # Частота устройства: Bluetooth часто не поддерживает 48 кГц
+        if device is not None:
+            try:
+                self._sample_rate = int(
+                    sd.query_devices(device).get("default_samplerate", SAMPLE_RATE)
+                )
+            except Exception:  # noqa: BLE001 - не удалось узнать частоту
+                self._sample_rate = SAMPLE_RATE
+
         self._stream = sd.InputStream(
             device=device,
             channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
+            samplerate=self._sample_rate,
             dtype=DTYPE,
             callback=self._audio_callback,
         )
@@ -774,7 +808,7 @@ class Recorder:
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(CHANNELS)
             wav.setsampwidth(2)
-            wav.setframerate(SAMPLE_RATE)
+            wav.setframerate(self._sample_rate)
             if spill is not None and spill.is_file():
                 with spill.open("rb") as raw:
                     while True:

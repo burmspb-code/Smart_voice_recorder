@@ -846,6 +846,12 @@ class MainWindow(QMainWindow):
             if position >= 0:
                 self.device_box.setCurrentIndex(position)
 
+        # Если выбранный микрофон не попал в список (отключён, выдернут
+        # из USB или больше не передаёт звук) — берём первое рабочее,
+        # чтобы в интерфейсе всегда был активный микрофон.
+        if self.device_box.currentData() is None:
+            self.device_box.setCurrentIndex(0)
+
         self.record_button.setEnabled(True)
         skipped = len(self._candidates) - len(devices)
         suffix = f", отброшено {skipped}" if skipped > 0 else ""
