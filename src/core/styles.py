@@ -122,10 +122,11 @@ QWidget {{
     font-family: "Segoe UI", sans-serif;
     font-size: 13px;
     color: {TEXT};
+    background-color: {BACKGROUND};
 }}
 
 QMainWindow, QDialog {{
-    background: {BACKGROUND};
+    background-color: {BACKGROUND};
 }}
 
 /* --- Подписи --------------------------------------------------------- */

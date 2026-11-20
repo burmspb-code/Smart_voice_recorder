@@ -200,6 +200,10 @@ class MainWindow(QMainWindow):
         # Окно открывается ровно под содержимое: вторая зона свёрнута
         self.resize(920, 380)
 
+        # Заголовок окна тёмный: без этого Windows рисует его белым,
+        # и на тёмном интерфейсе приложения он выглядит чужеродно.
+        self._set_dark_title_bar()
+
         self.settings = Settings()
         self.recordings = self.settings.recordings_path()
         self.model_store = ModelStore()
@@ -1987,6 +1991,10 @@ class MainWindow(QMainWindow):
             self._fitted_once = True
             self._fit_window()
 
+        # Заголовок окна тёмный: без этого Windows рисует его белым,
+        # и на тёмном интерфейсе он выглядит чужеродно.
+        self._set_dark_title_bar()
+
         # Уведомление о первой загрузке показываем уже на экране, а не
         # до показа окна: иначе диалог появился бы над пустым рабочим
         # столом, и было бы непонятно, к чему он относится.
@@ -1996,6 +2004,30 @@ class MainWindow(QMainWindow):
         elif self._model_moved_from is not None and not self._moved_notice_shown:
             self._moved_notice_shown = True
             QTimer.singleShot(0, self._announce_move)
+
+    def _set_dark_title_bar(self) -> None:
+        """Делает заголовок окна тёмным в Windows.
+
+        Без этого заголовок остаётся белым (или цветом системы), и
+        на тёмном интерфейсе приложения выглядит чужеродно.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = int(self.winId())
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 19
+            value = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                ctypes.c_uint(DWMWA_USE_IMMERSIVE_DARK_MODE),
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+            )
+        except Exception:  # noqa: BLE001 - старая Windows или нет dwmapi
+            pass
 
     # ---------------------------------------------------------------- выход
 
